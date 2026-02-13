@@ -1,0 +1,1033 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>PC Control Global</title>
+
+<style>
+:root {
+    --on:#22c55e;
+    --warn:#eab308;
+    --off:#111;
+    --bg:#f4f4f5;
+    --muted:#6b7280;
+    --danger:#ef4444;
+    --primary:#3b82f6;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin:0;
+    background:var(--bg);
+    font-family:system-ui,sans-serif;
+    padding:16px;
+    min-height:100vh;
+}
+
+/* Login Page */
+.login-page {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    padding: 16px;
+}
+
+.login-card {
+    background: #fff;
+    border-radius: 20px;
+    padding: 40px;
+    width: 100%;
+    max-width: 380px;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+    text-align: center;
+}
+
+.login-logo {
+    width: 80px;
+    height: 80px;
+    background: linear-gradient(135deg, var(--on), #16a34a);
+    border-radius: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0 auto 24px;
+}
+
+.login-logo svg {
+    width: 48px;
+    height: 48px;
+    color: #fff;
+}
+
+.login-title {
+    margin: 0 0 8px;
+    font-size: 24px;
+    font-weight: 700;
+    color: #1f2937;
+}
+
+.login-subtitle {
+    margin: 0 0 32px;
+    color: var(--muted);
+    font-size: 14px;
+}
+
+.login-form label {
+    display: block;
+    text-align: left;
+    font-size: 13px;
+    color: var(--muted);
+    margin-bottom: 6px;
+    font-weight: 500;
+}
+
+.login-form input {
+    width: 100%;
+    padding: 14px 16px;
+    margin-bottom: 20px;
+    border-radius: 10px;
+    border: 2px solid #e5e7eb;
+    font-size: 15px;
+    transition: border-color 0.2s;
+}
+
+.login-form input:focus {
+    outline: none;
+    border-color: var(--primary);
+}
+
+.login-form input.error {
+    border-color: var(--danger);
+}
+
+.login-error {
+    background: #fef2f2;
+    color: var(--danger);
+    padding: 12px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+    font-size: 14px;
+    display: none;
+}
+
+.login-error.show {
+    display: block;
+}
+
+.login-btn {
+    width: 100%;
+    padding: 14px;
+    background: linear-gradient(135deg, var(--primary), #2563eb);
+    color: #fff;
+    border: none;
+    border-radius: 10px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.login-btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+}
+
+.login-btn:active {
+    transform: translateY(0);
+}
+
+.login-footer {
+    margin-top: 24px;
+    font-size: 13px;
+    color: var(--muted);
+}
+
+/* Dashboard */
+.dashboard {
+    display: none;
+    width: 100%;
+    max-width: 1200px;
+    margin: 0 auto;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.dashboard.visible {
+    display: flex;
+}
+
+/* Firebase top */
+.firebase-top {
+    background:#fff;
+    border-radius:14px;
+    padding:10px 14px;
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    box-shadow:0 4px 6px rgba(0,0,0,0.05);
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.user-info {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.user-avatar {
+    width: 32px;
+    height: 32px;
+    background: linear-gradient(135deg, var(--primary), #2563eb);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-weight: 600;
+    font-size: 14px;
+}
+
+.user-name {
+    font-weight: 600;
+    font-size: 14px;
+    color: #374151;
+}
+
+.connection-status {
+    display:flex;
+    align-items:center;
+    gap:6px;
+    font-weight:600;
+    font-size:13px;
+}
+
+.connection-status .dot {
+    width:8px;
+    height:8px;
+    border-radius:50%;
+    background:#ef4444;
+}
+
+.connected .dot { background:var(--on); }
+
+.fb-connect-btn {
+    background:var(--on);
+    color:#fff;
+    border:none;
+    padding:6px 14px;
+    border-radius:8px;
+    cursor:pointer;
+    font-weight:600;
+    transition: background 0.2s;
+}
+
+.fb-connect-btn:hover {
+    background: #16a34a;
+}
+
+.logout-btn {
+    background: #f3f4f6;
+    color: #6b7280;
+    border: none;
+    padding: 6px 14px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-weight: 600;
+    transition: all 0.2s;
+}
+
+.logout-btn:hover {
+    background: #fee2e2;
+    color: var(--danger);
+}
+
+/* Filter */
+.filter-bar {
+    display:flex;
+    gap:8px;
+}
+
+.filter-bar input,
+.filter-bar select {
+    width:100%;
+    padding:10px;
+    border-radius:8px;
+    border:1px solid #ccc;
+    font-size:14px;
+}
+
+/* Header */
+.header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.header-row h2 {
+    margin: 0;
+    font-size: 18px;
+    color: #333;
+}
+
+/* Cards Grid */
+.cards-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 16px;
+}
+
+/* Card */
+.card {
+    background:#fff;
+    border-radius:14px;
+    padding:16px;
+    text-align:center;
+    box-shadow:0 4px 6px rgba(0,0,0,0.05);
+    position: relative;
+    transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.card:hover {
+    transform: translateY(-2px);
+    box-shadow:0 8px 12px rgba(0,0,0,0.1);
+}
+
+/* Header actions - delete & edit icons */
+.card-header-actions {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    display: flex;
+    gap: 6px;
+    opacity: 0;
+    transition: opacity 0.2s;
+}
+
+.card:hover .card-header-actions {
+    opacity: 1;
+}
+
+.icon-btn {
+    width: 28px;
+    height: 28px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(255,255,255,0.9);
+    transition: all 0.2s;
+}
+
+.icon-btn:hover {
+    background: #e5e7eb;
+}
+
+.icon-btn.delete-btn:hover {
+    background: #fee2e2;
+}
+
+.icon-btn.delete-btn:hover svg {
+    color: var(--danger);
+}
+
+.icon-btn.edit-btn:hover {
+    background: #dbeafe;
+}
+
+.icon-btn.edit-btn:hover svg {
+    color: #3b82f6;
+}
+
+.icon-btn svg {
+    width: 16px;
+    height: 16px;
+    color: #6b7280;
+}
+
+/* PC Icon */
+.pc-icon {
+    margin-bottom: 8px;
+}
+
+.pc-screen { fill:var(--off); transition: fill 0.3s; }
+.pc-on .pc-screen { fill:var(--on); filter: drop-shadow(0 0 8px var(--on)); }
+.pc-starting .pc-screen { fill:var(--warn); }
+
+.card-title {
+    font-size: 15px;
+    font-weight: 700;
+    margin: 0 0 4px 0;
+    color: #1f2937;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.card-city {
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 10px;
+}
+
+/* Buttons */
+.card-actions {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.card-btn {
+    flex: 1;
+    padding: 10px 8px;
+    font-size: 12px;
+    font-weight: 600;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.card-btn:hover {
+    opacity: 0.9;
+    transform: scale(1.02);
+}
+
+.card-btn:active {
+    transform: scale(0.98);
+}
+
+.power-on { background: var(--on); color: #fff; }
+.power-off { background: #6b7280; color: #fff; }
+.reboot-btn { background: var(--warn); color: #fff; }
+
+/* Info */
+.card-info {
+    font-size: 12px;
+    background: #f9fafb;
+    border-radius: 8px;
+    padding: 10px;
+}
+
+.info-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 3px 0;
+}
+
+.info-label { color: var(--muted); }
+.info-value { 
+    font-weight: 600; 
+    color: #374151;
+}
+
+.status-online { color: var(--on); font-weight: 700; }
+.status-offline { color: var(--danger); }
+
+/* Add Card */
+.add-card {
+    background: #fff;
+    border: 2px dashed #d1d5db;
+    border-radius: 14px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 280px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.add-card:hover {
+    border-color: var(--on);
+    background: #f0fdf4;
+}
+
+.add-card svg {
+    width: 48px;
+    height: 48px;
+    color: #9ca3af;
+    margin-bottom: 8px;
+}
+
+.add-card:hover svg {
+    color: var(--on);
+}
+
+.add-card span {
+    color: #6b7280;
+    font-weight: 600;
+}
+
+.add-card:hover span {
+    color: var(--on);
+}
+
+/* Modal */
+.modal-overlay {
+    position:fixed;
+    inset:0;
+    background:rgba(0,0,0,.5);
+    display:none;
+    justify-content:center;
+    align-items:center;
+    z-index:100;
+}
+
+.modal {
+    background:white;
+    padding:24px;
+    border-radius:14px;
+    width:320px;
+    max-width: 90vw;
+}
+
+.modal h4 {
+    margin: 0 0 16px 0;
+    font-size: 18px;
+}
+
+.modal label {
+    font-size:12px;
+    color:var(--muted);
+    display: block;
+    margin-bottom: 4px;
+}
+
+.modal input,
+.modal select {
+    width:100%;
+    padding:10px;
+    margin-bottom:14px;
+    border-radius:8px;
+    border:1px solid #ccc;
+    font-size:14px;
+}
+
+.modal-buttons {
+    display:flex;
+    justify-content:flex-end;
+    gap:10px;
+    margin-top: 8px;
+}
+
+.modal-buttons button {
+    padding: 10px 20px;
+    border-radius: 8px;
+    border: 1px solid #ccc;
+    background: #f3f4f6;
+    cursor: pointer;
+    font-weight: 600;
+}
+
+.modal-buttons button:last-child {
+    background: var(--on);
+    color: white;
+    border: none;
+}
+
+/* Responsive */
+@media (max-width: 600px) {
+    .login-card {
+        padding: 30px 24px;
+    }
+    
+    .cards-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .filter-bar {
+        flex-direction: column;
+    }
+    
+    .firebase-top {
+        flex-direction: column;
+    }
+    
+    .user-info {
+        width: 100%;
+        justify-content: center;
+    }
+}
+</style>
+</head>
+
+<body>
+
+<!-- Login Page -->
+<div class="login-page" id="loginPage">
+    <div class="login-card">
+         <!--<div class="login-logo">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+            </svg>
+        </div>-->
+        <!--<h1 class="login-title">PC Control</h1>-->
+        <!--<p class="login-subtitle">Управление компьютерами удалённо</p>-->
+        
+        <form class="login-form" id="loginForm" onsubmit="handleLogin(event)">
+            <div class="login-error" id="loginError">
+                Неверный логин или пароль
+            </div>
+            
+            <label for="loginUsername">Логин</label>
+            <input type="text" id="loginUsername" placeholder="Введите логин" autocomplete="username" required>
+            
+            <label for="loginPassword">Пароль</label>
+            <input type="password" id="loginPassword" placeholder="Введите пароль" autocomplete="current-password" required>
+            
+            <button type="submit" class="login-btn">Войти</button>
+        </form>
+        
+        <p class="login-footer">Доступ только для авторизованных пользователей</p>
+    </div>
+</div>
+
+<!-- Dashboard -->
+<div class="dashboard" id="dashboard">
+
+<!-- Firebase -->
+<div class="firebase-top">
+    <div class="user-info">
+        <div class="user-avatar" id="userAvatar">A</div>
+        <span class="user-name" id="userName">Администратор</span>
+    </div>
+    
+    <div style="display: flex; gap: 10px; align-items: center;">
+        <div class="connection-status" id="conn">
+            <span class="dot"></span>
+            <span id="conn-text">Ожидание</span>
+        </div>
+        <button class="fb-connect-btn" onclick="initFirebase()">Подключиться</button>
+        <button class="logout-btn" onclick="handleLogout()">Выход</button>
+    </div>
+</div>
+
+<!-- Filters -->
+<div class="filter-bar">
+    <input id="searchInput" placeholder="🔍 Поиск устройства...">
+    <select id="cityFilter" style="max-width: 200px;">
+        <option value="all">Все города</option>
+        <option value="Челябинск">Челябинск</option>
+        <option value="Магнитогорск">Магнитогорск</option>
+    </select>
+</div>
+
+<!-- Header -->
+<div class="header-row">
+    <h2>Мои устройства</h2>
+</div>
+
+<!-- Cards Grid -->
+<div class="cards-grid" id="cards-container">
+    <!-- Cards will be rendered here -->
+</div>
+
+</div>
+
+<!-- Modal Add/Edit -->
+<div class="modal-overlay" id="modal">
+<div class="modal">
+    <h4 id="modal-title">Новое устройство</h4>
+
+    <label>Название</label>
+    <input id="inp-name" placeholder="Например: Офис ПК">
+
+    <label>Город</label>
+    <select id="inp-city">
+        <option>Челябинск</option>
+        <option>Магнитогорск</option>
+    </select>
+
+    <label>Адрес</label>
+    <input id="inp-address" placeholder="Улица, дом">
+
+    <label>Node ID</label>
+    <input id="inp-node" placeholder="ID узла">
+
+    <label>Pin</label>
+    <select id="inp-pin">
+        <option value="0">0</option>
+        <option value="1">1</option>
+        <option value="2">2</option>
+    </select>
+
+    <div class="modal-buttons">
+        <button onclick="closeModal()">Отмена</button>
+        <button onclick="saveDevice()">Сохранить</button>
+    </div>
+</div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+<script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-database.js"></script>
+
+<script>
+// ============ AUTH CONFIG ============
+const AUTH_CONFIG = {
+    users: [
+        { username: "admin", password: "admin", name: "Администратор" },
+        { username: "user", password: "user123", name: "Пользователь" },
+        { username: "tech", password: "tech123", name: "Техник" }
+    ],
+    sessionKey: "pccontrol_session"
+};
+
+// ============ AUTH FUNCTIONS ============
+function handleLogin(event) {
+    event.preventDefault();
+    
+    const username = document.getElementById("loginUsername").value.trim();
+    const password = document.getElementById("loginPassword").value;
+    const errorEl = document.getElementById("loginError");
+    
+    const user = AUTH_CONFIG.users.find(u => 
+        u.username === username && u.password === password
+    );
+    
+    if (user) {
+        sessionStorage.setItem(AUTH_CONFIG.sessionKey, JSON.stringify({
+            username: user.username,
+            name: user.name,
+            loginTime: Date.now()
+        }));
+        showDashboard(user);
+    } else {
+        errorEl.classList.add("show");
+        document.getElementById("loginPassword").classList.add("error");
+        
+        setTimeout(() => {
+            errorEl.classList.remove("show");
+            document.getElementById("loginPassword").classList.remove("error");
+        }, 3000);
+    }
+}
+
+function handleLogout() {
+    sessionStorage.removeItem(AUTH_CONFIG.sessionKey);
+    location.reload();
+}
+
+function checkSession() {
+    const session = sessionStorage.getItem(AUTH_CONFIG.sessionKey);
+    if (session) {
+        const user = JSON.parse(session);
+        showDashboard(user);
+        return true;
+    }
+    return false;
+}
+
+function showDashboard(user) {
+    document.getElementById("loginPage").style.display = "none";
+    document.getElementById("dashboard").classList.add("visible");
+    document.getElementById("userName").textContent = user.name;
+    document.getElementById("userAvatar").textContent = user.name.charAt(0).toUpperCase();
+}
+
+// ============ FIREBASE & DEVICES ============
+let db, devicesRef;
+let devices = [];
+let editMode = false;
+let editingKey = null;
+let statusListeners = {};
+let deviceStatus = {}; // Хранит текущие статусы устройств
+
+const modal = document.getElementById("modal");
+const cardsContainer = document.getElementById("cards-container");
+const searchInput = document.getElementById("searchInput");
+const cityFilter = document.getElementById("cityFilter");
+
+function initFirebase() {
+    const apiKey = localStorage.fb_apiKey;
+    const projectId = localStorage.fb_projectId;
+    const dbUrl = localStorage.fb_dbUrl;
+
+    if (!apiKey || !projectId || !dbUrl) {
+        alert("Firebase config отсутствует в localStorage");
+        return;
+    }
+
+    if (!firebase.apps.length) {
+        firebase.initializeApp({ apiKey, projectId, databaseURL: dbUrl });
+    }
+
+    db = firebase.database();
+    devicesRef = db.ref("dashboard_devices");
+
+    document.getElementById("conn").classList.add("connected");
+    document.getElementById("conn-text").innerText = "Подключено";
+
+    devicesRef.on("value", snap => {
+        devices = [];
+        if (snap.val()) {
+            Object.entries(snap.val()).forEach(([k, v]) => {
+                devices.push({ ...v, key: k });
+            });
+        }
+        renderCards();
+        setupStatusListeners();
+    });
+}
+
+function setupStatusListeners() {
+    Object.values(statusListeners).forEach(ref => ref.off());
+    statusListeners = {};
+
+    devices.forEach(d => {
+        const ref = db.ref(`nodes/${d.nodeId}/pins/${d.pin}/status`);
+        ref.on("value", s => {
+            const status = s.val();
+            deviceStatus[d.key] = status;
+            updateCardStatus(d.key, status);
+        });
+        statusListeners[d.key] = ref;
+    });
+}
+
+function updateCardStatus(deviceKey, status) {
+    const statusEl = document.getElementById(`status-${deviceKey}`);
+    const cardEl = document.querySelector(`[data-key="${deviceKey}"]`);
+    const screenEl = document.querySelector(`[data-key="${deviceKey}"] .pc-screen`);
+    const ledEl = document.querySelector(`[data-key="${deviceKey}"] .pc-led`);
+    const powerBtn = document.querySelector(`[data-key="${deviceKey}"] .power-btn`);
+    
+    if (statusEl) {
+        statusEl.innerText = status || "—";
+        statusEl.className = "info-value " + (status === "ON" ? "status-online" : status === "OFF" ? "status-offline" : "");
+    }
+    
+    const isOn = status === "ON";
+    
+    // Обновляем иконку ПК (монитор)
+    if (cardEl) {
+        const pcIcon = cardEl.querySelector('.pc-icon');
+        if (pcIcon) {
+            if (isOn) {
+                pcIcon.classList.add('pc-on');
+            } else {
+                pcIcon.classList.remove('pc-on');
+            }
+        }
+    }
+    
+    // Обновляем LED индикатор
+    if (ledEl) {
+        ledEl.setAttribute('fill', isOn ? '#22c55e' : '#9ca3af');
+    }
+    
+    // Обновляем кнопку
+    if (powerBtn) {
+        powerBtn.textContent = isOn ? 'Выключить' : 'Включить';
+        powerBtn.className = 'card-btn power-btn ' + (isOn ? 'power-off' : 'power-on');
+    }
+}
+
+function renderCards() {
+    const q = searchInput.value.toLowerCase();
+    const city = cityFilter.value;
+
+    const filtered = devices.filter(d =>
+        (city === "all" || d.city === city) &&
+        d.name.toLowerCase().includes(q)
+    );
+
+    let html = "";
+
+    filtered.forEach(d => {
+        const status = deviceStatus[d.key] || 'OFF';
+        const isOn = status === 'ON';
+        
+        html += `
+            <div class="card" data-key="${d.key}">
+                <div class="card-header-actions">
+                    <button class="icon-btn edit-btn" onclick="openEditModal('${d.key}')" title="Редактировать">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                        </svg>
+                    </button>
+                    <button class="icon-btn delete-btn" onclick="deleteDevice('${d.key}')" title="Удалить">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                    </button>
+                </div>
+                
+                <div class="pc-icon ${isOn ? 'pc-on' : ''}">
+                    <svg viewBox="0 0 160 130" width="80" height="65">
+                        <rect x="6" y="6" rx="10" ry="10" width="148" height="92" fill="none" stroke="#e5e7eb" stroke-width="3"/>
+                        <rect class="pc-screen" x="14" y="14" rx="6" ry="6" width="132" height="72"/>
+                        <circle class="pc-led" cx="80" cy="104" r="4" fill="${isOn ? '#22c55e' : '#9ca3af'}"/>
+                        <rect x="72" y="100" width="16" height="10" rx="3" fill="#d1d5db"/>
+                        <rect x="56" y="112" width="48" height="6" rx="3" fill="#d1d5db"/>
+                    </svg>
+                </div>
+                
+                <h3 class="card-title">${d.name}</h3>
+                <div class="card-city">📍 ${d.city}</div>
+                
+                <div class="card-actions">
+                    <button class="card-btn power-btn ${isOn ? 'power-off' : 'power-on'}" onclick="sendCommand('${d.key}', 'POWER')">${isOn ? 'Выключить' : 'Включить'}</button>
+                    <button class="card-btn reboot-btn" onclick="sendCommand('${d.key}', 'REBOOT')">Перезагрузка</button>
+                </div>
+                
+                <div class="card-info">
+                    <div class="info-row">
+                        <span class="info-label">📍 Адрес:</span>
+                        <span class="info-value">${d.address || "—"}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">📡 Node:</span>
+                        <span class="info-value">${d.nodeId}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">🔌 Pin:</span>
+                        <span class="info-value">${d.pin}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">📊 Статус:</span>
+                        <span class="info-value ${isOn ? 'status-online' : 'status-offline'}" id="status-${d.key}">${status}</span>
+                    </div>
+                </div>
+            </div>
+        `;
+    });
+
+    html += `
+        <div class="add-card" onclick="openModal()">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4" />
+            </svg>
+            <span>Добавить устройство</span>
+        </div>
+    `;
+
+    cardsContainer.innerHTML = html;
+}
+
+searchInput.oninput = renderCards;
+cityFilter.onchange = renderCards;
+
+function sendCommand(deviceKey, cmd) {
+    const device = devices.find(d => d.key === deviceKey);
+    if (!device) return;
+    db.ref(`nodes/${device.nodeId}/pins/${device.pin}/command`).set(cmd);
+}
+
+function openModal() {
+    editMode = false;
+    editingKey = null;
+    document.getElementById("modal-title").innerText = "Новое устройство";
+    document.getElementById("inp-name").value = "";
+    document.getElementById("inp-city").value = "Челябинск";
+    document.getElementById("inp-address").value = "";
+    document.getElementById("inp-node").value = "";
+    document.getElementById("inp-pin").value = "0";
+    modal.style.display = "flex";
+}
+
+function openEditModal(deviceKey) {
+    const device = devices.find(d => d.key === deviceKey);
+    if (!device) return;
+    
+    editMode = true;
+    editingKey = deviceKey;
+    document.getElementById("modal-title").innerText = "Редактировать устройство";
+    document.getElementById("inp-name").value = device.name || "";
+    document.getElementById("inp-city").value = device.city || "Челябинск";
+    document.getElementById("inp-address").value = device.address || "";
+    document.getElementById("inp-node").value = device.nodeId || "";
+    document.getElementById("inp-pin").value = device.pin || "0";
+    modal.style.display = "flex";
+}
+
+function closeModal() {
+    modal.style.display = "none";
+    editMode = false;
+    editingKey = null;
+}
+
+modal.onclick = e => { if (e.target === modal) closeModal(); };
+
+function saveDevice() {
+    const name = document.getElementById("inp-name").value.trim();
+    const city = document.getElementById("inp-city").value;
+    const address = document.getElementById("inp-address").value.trim();
+    const nodeId = document.getElementById("inp-node").value.trim();
+    const pin = document.getElementById("inp-pin").value;
+
+    if (!name || !nodeId) {
+        alert("Заполните название и Node ID");
+        return;
+    }
+
+    const deviceData = {
+        name: name,
+        city: city,
+        address: address,
+        nodeId: nodeId,
+        pin: pin
+    };
+
+    if (editMode && editingKey) {
+        devicesRef.child(editingKey).update(deviceData, (error) => {
+            if (error) {
+                alert("Ошибка при обновлении: " + error.message);
+            } else {
+                closeModal();
+            }
+        });
+    } else {
+        devicesRef.push(deviceData, (error) => {
+            if (error) {
+                alert("Ошибка при сохранении: " + error.message);
+            } else {
+                closeModal();
+            }
+        });
+    }
+}
+
+function deleteDevice(deviceKey) {
+    const device = devices.find(d => d.key === deviceKey);
+    if (!device) return;
+    
+    if (confirm(`Удалить устройство "${device.name}"?`)) {
+        devicesRef.child(deviceKey).remove((error) => {
+            if (error) {
+                alert("Ошибка при удалении: " + error.message);
+            }
+        });
+    }
+}
+
+// ============ INIT ============
+document.addEventListener("DOMContentLoaded", () => {
+    checkSession();
+});
+</script>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+<script>
+  const tg = window.Telegram.WebApp;
+  tg.ready();
+  tg.expand();
+
+  const theme = tg.themeParams;
+
+  document.body.style.background = theme.bg_color || "#0f172a";
+  document.body.style.color = theme.text_color || "#ffffff";
+</script>
+</body>
+</html>
+</body>
+</html>
