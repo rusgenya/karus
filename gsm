@@ -1,0 +1,854 @@
+/*
+====================================================================
+ PRO FIX v7.5 - ULTIMATE HYBRID FIRMWARE (UNAVAILABLE-SCREEN PROMPT)
+ ESP32 + SIM800L (.AMR audio) + 9 RELAYS + MULTI-SMS + WATCHDOG
+ Integrated Features:
+  - Non-blocking Unified UART Parser & Async Watchdog
+  - Postponed SMS during active call/pulses (No PC hard-off)
+  - Pin 13 instead of 14 for Relay 6 (Boot glitch fixed)
+  - Under-voltage & Power-down detection
+  - SMS '>' prompt wait with ESC cancel
+  - Audio playback via AT+CMEDPLAY + AT+CRSL/AT+CLVL (confirmed working)
+  - Up to three screen/PC groups (A/B/C) — 9 relays total
+  - SMS text sent in Russian (Cyrillic), UCS2 + correct DCS
+  - DEVICE_ADDRESS text prepended to every phase-status SMS
+  - SCREEN_COUNT compile-time switch to enable 1, 2, or 3 groups
+  - Voice feedback ("недоступно") when pressing a screen digit that
+    SCREEN_COUNT doesn't have configured
+
+ CHANGES vs v7.4:
+  - ADDED: a 6th voice prompt file is now needed on the modem's
+    filesystem — "C:\User\0006.amr". Record something like "Экран
+    недоступен, выберите другой пункт" or "Неверный выбор". Upload it
+    the same way you uploaded 0001-0005.amr.
+  - CHANGED: pressing "2" from the root menu when SCREEN_COUNT < 2, or
+    "3" when SCREEN_COUNT < 3, now plays 0006.amr instead of doing
+    nothing. The caller stays in ROOT_MENU (menu state is NOT changed,
+    unlike a real selection) so they can immediately try a valid
+    digit again without having to press "0" first.
+  - This matters specifically because 0001.amr (the root-menu prompt)
+    is a static recording — it doesn't know SCREEN_COUNT and will
+    keep saying "нажмите три" even when group C isn't wired up. This
+    change means pressing 3 on such a device at least gets an
+    audible "not available" response instead of silence, rather than
+    requiring you to re-record 0001.amr per site to match its actual
+    SCREEN_COUNT.
+
+ CHANGES vs v7.3 (carried over from v7.4):
+  - ADDED: utf8ToUcs2Hex() — converts a UTF-8 String (as stored in
+    this .ino file, which Arduino IDE saves as UTF-8 by default) into
+    the HEX-encoded UCS2 (UTF-16BE) format SIM800 requires for
+    non-Latin SMS text.
+  - CHANGED: sendSMS() now switches the modem to AT+CSCS="UCS2" right
+    before sending (encoding both the phone number and the message
+    body as UCS2 hex), then switches back to AT+CSCS="GSM" (plain
+    ASCII) immediately after. The switch-back is important: leaving
+    UCS2 on globally would break AT+CMEDPLAY's plain-ASCII file path
+    argument used by playAmr().
+  - CHANGED: all SMS body text (boot message, phase status, denied
+    call notification) translated to Russian.
+  - NOTE: this firmware's own .ino source must stay saved as UTF-8
+    (Arduino IDE's default) for the Cyrillic literals in the code to
+    convert correctly — if you ever re-save it with a different
+    encoding, the Russian text will come out corrupted.
+
+ CHANGES vs v6.9 (carried over from v7.0):
+  - ADDED: Relay 7 (Screen C power, 220V) on GPIO14
+  - ADDED: Relay 8 (PC C power SW) on GPIO18
+  - ADDED: Relay 9 (PC C reset SW) on GPIO19
+    GPIO14/18/19 chosen because they are free on this board's pinout
+    (not already used by SIM800/phases/relays 1-6) and are NOT ESP32
+    strapping pins (0, 2, 12, 15), so they're safe as plain outputs.
+  - ADDED: MENU_C DTMF menu — press "3" from the root menu (in
+    addition to existing "1"=Screen/PC A, "2"=Screen/PC B) to reach
+    the same 1/2/3/0 sub-menu for group C.
+  - ADDED: a 5th voice prompt file is now needed on the modem's
+    filesystem — "C:\User\0005.amr" — played when entering MENU_C
+    (analogous to 0002.amr for menu A, 0003.amr for menu B). Record
+    and upload it the same way you uploaded 0001-0004.amr, or DTMF
+    "3" will trigger playback of a file that doesn't exist and the
+    modem will likely just respond ERROR/silently fail — the relay
+    logic itself does not depend on this file being present.
+  - Output arrays (outputPins/pinState/pinTimer/pinDuration) and all
+    loops over them (anyOutputBusy, outputHandler) extended from 6 to
+    9 elements — this was necessary and is a mechanical, not logical,
+    change: any hardcoded "6" would have silently ignored relays 7-9.
+====================================================================
+*/
+
+#include <Arduino.h>
+#include <HardwareSerial.h>
+
+#define FW_VERSION "v7.5-ULTIMATE"
+
+// ================= SIM800 =================
+HardwareSerial sim800(2);
+#define SIM800_RST_PIN    4      // Аппаратный сброс модема (RST)
+#define SIM800_RX_PIN    16
+#define SIM800_TX_PIN    17
+
+// ================= RELAYS (9 КАНАЛОВ) =================
+#define RELAY_SCREEN_A   25     // Реле 1: Питание Экрана А (220V)
+#define RELAY_PC_A_PWR   26     // Реле 2: ПК А Power SW
+#define RELAY_PC_A_RST   27     // Реле 3: ПК А Reset SW
+
+#define RELAY_SCREEN_B   32     // Реле 4: Питание Экрана Б (220V)
+#define RELAY_PC_B_PWR   33     // Реле 5: ПК Б Power SW
+#define RELAY_PC_B_RST   13     // Реле 6: ПК Б Reset SW (GPIO13)
+
+#define RELAY_SCREEN_C   14     // Реле 7: Питание Экрана С (220V)
+#define RELAY_PC_C_PWR   18     // Реле 8: ПК С Power SW
+#define RELAY_PC_C_RST   19     // Реле 9: ПК С Reset SW
+
+// Логика работы реле: 1 = Active-HIGH (HIGH = вкл), 0 = Active-LOW (LOW = вкл)
+#define RELAY_ACTIVE_HIGH 1
+
+// ================= PHASES =================
+#define PHASE_A 21
+#define PHASE_B 22
+#define PHASE_C 23
+
+// ================= TIMINGS ===============
+#define TIMEOUT_SCREEN     60000UL  // Перезагрузка питания экрана (60 сек)
+#define PULSE_PC_SHORT       500UL  // Импульс кнопки ПК (0.5 сек)
+
+#define DTMF_GUARD           600UL
+#define CALL_TIMEOUT      180000UL
+#define PHASE_DEBOUNCE      5000UL
+#define GREETING_DELAY      1500UL  // Задержка перед проигрыванием приветствия после ответа
+
+// Watchdog
+#define WDG_PING_EVERY     20000UL  // Проверка UART каждые 20 сек
+#define WDG_CREG_EVERY     60000UL  // Проверка регистрации каждые 60 сек
+#define WDG_UART_DEAD      90000UL  // Зависание UART > 90 сек
+#define WDG_REG_DEAD      240000UL  // Потеря сети > 4 мин
+
+#define DENIED_SMS_COOLDOWN 600000UL // Не уведомлять о чужих звонках чаще 10 мин
+#define CREG_POLL_TMO        1500UL
+
+// ================= КОЛИЧЕСТВО ПОДКЛЮЧЁННЫХ ЭКРАНОВ =================
+// Сколько групп "экран + ПК" физически подключено и должно работать:
+// 1 = только группа A (реле 1-3)
+// 2 = группы A и B (реле 1-6)
+// 3 = все три группы A, B, C (реле 1-9)
+// Это НЕ влияет на аудиофайлы — все они (0001-0005.amr) остаются
+// залитыми на SIM800L в любом случае. Меняется только то, реагирует
+// ли DTMF-меню на цифры "2"/"3" в корневом меню — при SCREEN_COUNT=1
+// или 2 соответствующие пункты меню просто не компилируются и лишний
+// звонок "не туда" никак не сработает.
+#define SCREEN_COUNT 2
+
+#if (SCREEN_COUNT < 1) || (SCREEN_COUNT > 3)
+  #error "SCREEN_COUNT must be 1, 2 or 3"
+#endif
+
+// ================= АДРЕС УСТАНОВКИ УСТРОЙСТВА =================
+// Впишите сюда обычный текст адреса (без markdown-ссылок [текст](url) —
+// телефон покажет квадратные скобки и URL буквально, как обычные
+// символы, ссылка кликабельной не станет). Эта строка автоматически
+// добавляется первой строкой и в приветственное SMS при включении, и
+// в SMS о смене состояния фазы — редактировать нужно только здесь.
+//
+// ВАЖНО: одно SMS с кириллицей (UCS2) вмещает примерно 70 символов на
+// сегмент. Если адрес длинный, всё сообщение (адрес + "СТАТУС ФАЗ:" +
+// три строки фаз) может не влезть в один сегмент — конкатенация
+// (склейка нескольких SMS в одно длинное сообщение на телефоне) в этой
+// прошивке не реализована, так что модем либо обрежет лишнее, либо
+// отправит несколько отдельных SMS без индикации "1/2, 2/2". Старайтесь
+// укладываться в разумную длину, например 40-50 символов.
+#define DEVICE_ADDRESS "Ленина пр.-ул.Завенягина"
+
+// ================= НОМЕРА ДЛЯ СМС =================
+const char* TARGET_PHONES[] = {
+  "+79514629028",
+  "+79080810209",
+  "+79028955702",
+  "+79617959935",
+  "+79514344144"
+};
+const int TARGET_COUNT = sizeof(TARGET_PHONES) / sizeof(TARGET_PHONES[0]);
+
+// ================= БЕЛЫЙ СПИСОК ЗВОНКОВ =================
+const char* ALLOWED[] = {
+  "79514629028",
+  "79000284997",
+  "79925289148",
+  "79080810209",
+  "79028955702",
+  "79080812620",
+  "79823341420",
+  "79514344144",
+  "79617959935"
+};
+const int ALLOWED_COUNT = sizeof(ALLOWED) / sizeof(ALLOWED[0]);
+
+// ================= STATE ==================
+enum MenuState { ROOT_MENU, MENU_A, MENU_B, MENU_C };
+MenuState menu = ROOT_MENU;
+
+bool callActive   = false;
+unsigned long lastDTMF   = 0;
+unsigned long callStart  = 0;
+
+// Стабильные состояния фаз
+bool stablePhaseA = true, stablePhaseB = true, stablePhaseC = true;
+bool lastReadA = true, lastReadB = true, lastReadC = true;
+unsigned long phaseDebounceTimer = 0;
+
+// Отложенные действия
+bool phaseSMSPending = false;
+bool reinitPending   = false;
+bool cfunPending     = false;
+bool smsBusy         = false;
+
+// Неблокирующее приветствие после ответа на звонок
+bool pendingGreeting       = false;
+unsigned long pendingGreetingTime = 0;
+
+// Таймеры планировщика Watchdog
+unsigned long lastPingT = 0;
+unsigned long lastCregT = 0;
+
+unsigned long lastDeniedNotify = 0;
+
+// Телеметрия модема
+unsigned long lastModemOK      = 0;
+unsigned long lastRegOK        = 0;
+bool cregRegistered           = false;
+bool cregFresh                = false;
+bool waitOkFlag               = false;
+bool waitErrFlag              = false;
+bool smsDoneFlag              = false;
+bool smsSuccessFlag           = false;
+static bool cfgAppliedOnce    = false;
+
+// ================= HARDWARE MAP =================
+const byte outputPins[9] = {
+  RELAY_SCREEN_A, RELAY_PC_A_PWR, RELAY_PC_A_RST,
+  RELAY_SCREEN_B, RELAY_PC_B_PWR, RELAY_PC_B_RST,
+  RELAY_SCREEN_C, RELAY_PC_C_PWR, RELAY_PC_C_RST
+};
+
+bool          pinState[9]    = {0};
+unsigned long pinTimer[9]    = {0};
+unsigned long pinDuration[9] = {0};
+
+// Прототипы функций
+void relayOn(byte i);
+void relayOff(byte i);
+void pumpLines();
+void handleLine(String line);
+bool waitOK(uint32_t tmo);
+bool queryCREG();
+void configureModem();
+void initSIM();
+void resetSIMNetwork();
+void runWatchdog();
+void readSIM();
+void handleDTMF(char d);
+void pulseOutput(int index, unsigned long duration);
+bool anyOutputBusy();
+void outputHandler();
+void checkTimeout();
+void checkPhases();
+String buildPhaseStatus();
+void tryFlushPendingSMS();
+bool sendSMS(const String& number, const String& body);
+String utf8ToUcs2Hex(const String& utf8);
+bool waitPrompt(uint32_t tmo);
+void sendSMSToAll(const String& body);
+bool isNumberAllowed(String incoming);
+void sendAT(const char* cmd);
+void stopAmr();
+void playAmr(int fileNum);
+void serviceGreeting();
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(SIM800_RST_PIN, OUTPUT);
+  digitalWrite(SIM800_RST_PIN, HIGH);
+
+  pinMode(PHASE_A, INPUT_PULLUP);
+  pinMode(PHASE_B, INPUT_PULLUP);
+  pinMode(PHASE_C, INPUT_PULLUP);
+
+  for (int i = 0; i < 9; i++) {
+    pinMode(outputPins[i], OUTPUT);
+    relayOff(i);
+  }
+
+  stablePhaseA = (digitalRead(PHASE_A) == LOW);
+  stablePhaseB = (digitalRead(PHASE_B) == LOW);
+  stablePhaseC = (digitalRead(PHASE_C) == LOW);
+  lastReadA = stablePhaseA;
+  lastReadB = stablePhaseB;
+  lastReadC = stablePhaseC;
+
+  sim800.begin(9600, SERIAL_8N1, SIM800_RX_PIN, SIM800_TX_PIN);
+  delay(1000);
+
+  initSIM();
+
+  // Версия прошивки (FW_VERSION) больше не подставляется в текст SMS —
+  // вместо неё buildPhaseStatus() сама добавляет DEVICE_ADDRESS первой
+  // строкой. Версия по-прежнему видна в мониторе порта ниже.
+  String bootMsg = "СИСТЕМА ЗАПУЩЕНА\r\n" + buildPhaseStatus();
+  sendSMSToAll(bootMsg);
+
+  Serial.println(F("PRO FIX v7.5 ULTIMATE READY"));
+}
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+void loop() {
+  readSIM();          // Единый неблокирующий чтец UART
+  runWatchdog();      // Фоновый планировщик
+  outputHandler();
+  checkTimeout();
+  checkPhases();
+  serviceGreeting();  // Неблокирующее проигрывание приветствия
+
+  if (reinitPending) {
+    reinitPending = false;
+    initSIM();
+  } else if (cfunPending) {
+    cfunPending = false;
+    resetSIMNetwork();
+  }
+
+  tryFlushPendingSMS();
+}
+
+// =====================================================
+// РЕЛЕ С УЧЕТОМ ПОЛЯРНОСТИ
+// =====================================================
+void relayOn(byte i)  { digitalWrite(outputPins[i], RELAY_ACTIVE_HIGH ? HIGH : LOW); }
+void relayOff(byte i) { digitalWrite(outputPins[i], RELAY_ACTIVE_HIGH ? LOW  : HIGH); }
+
+// =====================================================
+// АСИНХРОННЫЙ ПАРСЕР UART
+// =====================================================
+void pumpLines() {
+  sim800.setTimeout(20);
+  while (sim800.available()) {
+    String line = sim800.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    handleLine(line);
+  }
+}
+
+void readSIM() { pumpLines(); }
+
+void handleLine(String line) {
+  Serial.println(line);
+
+  if (line.equals("OK")) {
+    lastModemOK = millis();
+    waitOkFlag = true;
+  }
+  if (line.indexOf("ERROR") >= 0) {
+    waitErrFlag = true;
+  }
+
+  if (line.indexOf("+CREG:") >= 0) {
+    int comma = line.indexOf(',');
+    if (comma > 0) {
+      int d = line.charAt(comma + 1) - '0';
+      bool reg = (d == 1 || d == 5);
+      if (reg) lastRegOK = millis();
+      if (reg != cregRegistered) {
+        cregRegistered = reg;
+        if (reg && cfgAppliedOnce) {
+          Serial.println(F("[Net] Network restored -> Re-applying config"));
+          configureModem();
+        } else if (reg) {
+          cfgAppliedOnce = true;
+        }
+      }
+      cregFresh = true;
+    }
+  }
+
+  // Детект просадки питания
+  if (line.indexOf("NORMAL POWER DOWN") >= 0 ||
+      line.indexOf("UNDER-VOLTAGE")   >= 0 ||
+      line.indexOf("UNDER VOLTAGE")   >= 0) {
+    Serial.println(F("[POWER] Power drop detected on SIM800L!"));
+    if (!reinitPending && !smsBusy) reinitPending = true;
+  }
+
+  if (line.indexOf("+CLIP") >= 0) {
+    if (callActive) return;
+    if (isNumberAllowed(line)) {
+      // Здесь НЕ используем delay(200)/delay(1500) — они блокируют
+      // чтение UART изнутри handleLine() и могут "съесть" параллельно
+      // пришедшие строки (повторный +CLIP, +CREG от вотчдога и т.п.).
+      // ATA шлётся немедленно; тот же интервал в 1.5с перед
+      // приветствием выдерживается неблокирующим таймером
+      // pendingGreeting, который обслуживается в serviceGreeting().
+      callActive = true;
+      callStart  = millis();
+      sendAT("ATA");
+      menu = ROOT_MENU;
+      pendingGreeting     = true;
+      pendingGreetingTime = millis();
+    } else {
+      sendAT("ATH");
+      if (millis() - lastDeniedNotify > DENIED_SMS_COOLDOWN) {
+        lastDeniedNotify = millis();
+        String body = "БЕЗОПАСНОСТЬ: попытка звонка с неразрешённого номера";
+        int q1i = line.indexOf('"');
+        int q2i = line.indexOf('"', q1i + 1);
+        if (q1i >= 0 && q2i > q1i) body += " с номера " + line.substring(q1i + 1, q2i);
+        if (!smsBusy) sendSMSToAll(body);
+      }
+    }
+    return;
+  }
+
+  if (line.indexOf("NO CARRIER") >= 0 || line.indexOf("BUSY") >= 0 || line.indexOf("NO ANSWER") >= 0) {
+    callActive = false;
+    pendingGreeting = false; // звонок сорвался — отменяем отложенное приветствие
+    menu = ROOT_MENU;
+    stopAmr();
+    return;
+  }
+
+  if (line.indexOf("+DTMF:") >= 0) {
+    char d = 0;
+    for (int i = line.length() - 1; i >= 0; i--) {
+      char c = line.charAt(i);
+      if ((c >= '0' && c <= '9') || c == '*' || c == '#' || (c >= 'A' && c <= 'D')) { d = c; break; }
+    }
+    if (d) handleDTMF(d);
+  }
+
+  if (line.indexOf("+CMGS:")    >= 0) { smsDoneFlag = true; smsSuccessFlag = true; }
+  if (line.indexOf("+CMS ERROR") >= 0) { smsDoneFlag = true; smsSuccessFlag = false; }
+}
+
+// Неблокирующая замена delay(1500) перед playAmr(1)
+void serviceGreeting() {
+  if (pendingGreeting && callActive &&
+      (millis() - pendingGreetingTime > GREETING_DELAY)) {
+    pendingGreeting = false;
+    playAmr(1);
+  }
+}
+
+bool waitOK(uint32_t tmo) {
+  waitOkFlag = false;
+  waitErrFlag = false;
+  unsigned long t = millis();
+  while (millis() - t < tmo) {
+    pumpLines();
+    if (waitOkFlag)  return true;
+    if (waitErrFlag) return false;
+  }
+  return false;
+}
+
+bool queryCREG() {
+  cregFresh = false;
+  sim800.println("AT+CREG?");
+  unsigned long t = millis();
+  while (millis() - t < CREG_POLL_TMO) {
+    pumpLines();
+    if (cregFresh) break;
+  }
+  return cregRegistered;
+}
+
+// Разбирает входящий поток построчно даже во время ожидания приглашения
+// AT+CMGS, прогоняя каждую полученную строку через handleLine() —
+// иначе URC-события (+CLIP, +CREG и т.п.), пришедшие в этот момент,
+// теряются (эту логику убрала "gemini"-версия — восстановлено).
+bool waitPrompt(uint32_t tmo) {
+  unsigned long t = millis();
+  String buf;
+  while (millis() - t < tmo) {
+    while (sim800.available()) {
+      char c = sim800.read();
+      if (c == '>') return true;
+      if (c == '\r') continue;
+      if (c == '\n') {
+        buf.trim();
+        if (buf.length() > 0) handleLine(buf);
+        buf = "";
+      } else {
+        buf += c;
+      }
+    }
+  }
+  buf.trim();
+  if (buf.length() > 0) handleLine(buf);
+  return false;
+}
+
+// Переводит UTF-8 строку (кириллица, как она хранится в .ino-файле —
+// Arduino IDE по умолчанию сохраняет исходники в UTF-8) в HEX-запись
+// UCS2 (UTF-16BE), как того требует SIM800 при AT+CSCS="UCS2".
+// Каждый символ -> 4 hex-цифры, без разделителей.
+String utf8ToUcs2Hex(const String& utf8) {
+  String hex = "";
+  size_t i = 0;
+  size_t len = utf8.length();
+  while (i < len) {
+    uint8_t c = (uint8_t)utf8[i];
+    uint32_t codepoint = 0;
+    uint8_t extraBytes = 0;
+
+    if (c < 0x80)              { codepoint = c;        extraBytes = 0; }
+    else if ((c & 0xE0) == 0xC0) { codepoint = c & 0x1F; extraBytes = 1; }
+    else if ((c & 0xF0) == 0xE0) { codepoint = c & 0x0F; extraBytes = 2; }
+    else if ((c & 0xF8) == 0xF0) { codepoint = c & 0x07; extraBytes = 3; }
+    else { i++; continue; } // некорректный байт — пропускаем
+
+    i++;
+    bool valid = true;
+    for (uint8_t k = 0; k < extraBytes; k++) {
+      if (i >= len) { valid = false; break; }
+      uint8_t cc = (uint8_t)utf8[i];
+      if ((cc & 0xC0) != 0x80) { valid = false; break; }
+      codepoint = (codepoint << 6) | (cc & 0x3F);
+      i++;
+    }
+    if (!valid) continue;
+
+    char buf[5];
+    if (codepoint <= 0xFFFF) {
+      snprintf(buf, sizeof(buf), "%04X", (unsigned int)codepoint);
+      hex += buf;
+    } else {
+      // Суррогатная пара — для кириллицы не требуется (она в BMP),
+      // но оставлено на случай эмодзи/редких символов.
+      codepoint -= 0x10000;
+      uint16_t hi = 0xD800 + (codepoint >> 10);
+      uint16_t lo = 0xDC00 + (codepoint & 0x3FF);
+      snprintf(buf, sizeof(buf), "%04X", hi); hex += buf;
+      snprintf(buf, sizeof(buf), "%04X", lo); hex += buf;
+    }
+  }
+  return hex;
+}
+
+bool sendSMS(const String& number, const String& body) {
+  smsBusy = true;
+
+  sim800.print(F("AT+CMGF=1\r"));
+  delay(100);
+  pumpLines();
+
+  // FIX v7.1: переключаемся на UCS2 только на время отправки SMS —
+  // это позволяет передавать кириллицу и в номере, и в тексте.
+  // Обязательно переключаем обратно на GSM (ASCII) после отправки,
+  // иначе сломается AT+CMEDPLAY с путём к .amr-файлу (playAmr) и
+  // другие команды, ожидающие обычные ASCII-строки.
+  sendAT("AT+CSCS=\"UCS2\"");
+  waitOK(1000);
+
+  sim800.print(F("AT+CMGS=\""));
+  sim800.print(utf8ToUcs2Hex(number));
+  sim800.print(F("\"\r"));
+
+  if (!waitPrompt(8000)) {
+    Serial.print(F("[SMS] Timeout waiting for '>' prompt: "));
+    Serial.println(number);
+    sim800.write(27); // ESC cancel
+    delay(300);
+    pumpLines();
+    sendAT("AT+CSCS=\"GSM\"");
+    waitOK(1000);
+    smsBusy = false;
+    return false;
+  }
+
+  sim800.print(utf8ToUcs2Hex(body));
+  sim800.write(26); // Ctrl+Z
+
+  smsDoneFlag = false;
+  smsSuccessFlag = false;
+  unsigned long t = millis();
+  while (millis() - t < 15000) {
+    pumpLines();
+    if (smsDoneFlag) break;
+  }
+
+  sendAT("AT+CSCS=\"GSM\"");
+  waitOK(1000);
+
+  smsBusy = false;
+  return smsSuccessFlag;
+}
+
+void sendSMSToAll(const String& body) {
+  for (int i = 0; i < TARGET_COUNT; i++) {
+    sendSMS(String(TARGET_PHONES[i]), body);
+    delay(1500);
+  }
+}
+
+void configureModem() {
+  sendAT("ATE0");               waitOK(1000);
+  sendAT("AT+CLIP=1");          waitOK(1000);
+  sendAT("AT+DDET=1,100,0,0"); waitOK(1000);
+  sendAT("AT+DTAM=2");          waitOK(1000);
+  sendAT("AT+CMGF=1");          waitOK(1000);
+  // Уровни громкости — судя по всему, именно этих двух команд не хватало
+  // раньше: AT+CRSL — громкость звонка, AT+CLVL — громкость динамика/
+  // разговорного тракта. Подтверждено рабочим тестом на реальном звонке.
+  sendAT("AT+CRSL=100");        waitOK(1000);
+  sendAT("AT+CLVL=100");        waitOK(1000);
+  // FIX v7.2: AT+CSCS="UCS2" (переключается в sendSMS()) сама по себе
+  // не заставляет модем пометить исходящую SMS как Unicode — DCS
+  // (Data Coding Scheme) в заголовке PDU задаётся отдельно через
+  // AT+CSMP. Без этого модем помечал SMS как обычный 7-бит GSM-алфавит,
+  // и телефон получателя декодировал UCS2-байты неправильно — отсюда
+  // "кракозябры". dcs=8 здесь означает UCS2. Ставим один раз при
+  // старте/переинициализации — раз теперь все наши SMS на русском,
+  // держим эту схему постоянно.
+  sendAT("AT+CSMP=17,167,0,8");  waitOK(1000);
+  cfgAppliedOnce = true;
+}
+
+void initSIM() {
+  Serial.println(F("[SIM] Hardware Resetting via Pin 4..."));
+  digitalWrite(SIM800_RST_PIN, LOW);
+  delay(200);
+  digitalWrite(SIM800_RST_PIN, HIGH);
+  delay(5000);
+
+  bool alive = false;
+  for (int i = 0; i < 12; i++) {
+    sim800.println("AT");
+    if (waitOK(500)) { alive = true; break; }
+    delay(200);
+  }
+
+  Serial.println(F("[SIM] Waiting for network registration..."));
+  bool registered = false;
+  for (int i = 0; i < 45; i++) {
+    if (queryCREG()) { registered = true; break; }
+    delay(1000);
+  }
+
+  configureModem();
+  lastModemOK = millis();
+  lastRegOK   = cregRegistered ? millis() : (millis() - WDG_REG_DEAD / 2);
+
+  sendAT("AT+CSQ");
+  waitOK(1000);
+}
+
+void runWatchdog() {
+  unsigned long now = millis();
+
+  if (!smsBusy) {
+    if (now - lastPingT > WDG_PING_EVERY) {
+      lastPingT = now;
+      sendAT("AT");
+    }
+    if (now - lastCregT > WDG_CREG_EVERY) {
+      lastCregT = now;
+      sendAT("AT+CREG?");
+    }
+  }
+
+  if (now - lastModemOK > WDG_UART_DEAD && !reinitPending) {
+    Serial.println(F("[Watchdog] UART Freeze detected -> Scheduling hardware reinit"));
+    reinitPending = true;
+    return;
+  }
+
+  if (now - lastRegOK > WDG_REG_DEAD && !callActive && !cfunPending && !reinitPending && !smsBusy) {
+    Serial.println(F("[Watchdog] Network Lost > 4m -> Scheduling CFUN restart"));
+    cfunPending = true;
+  }
+}
+
+void resetSIMNetwork() {
+  sendAT("AT+CFUN=0");
+  waitOK(3000);
+  delay(1000);
+  sendAT("AT+CFUN=1");
+  waitOK(3000);
+  lastRegOK = millis() - WDG_REG_DEAD + 120000UL;
+}
+
+bool anyOutputBusy() {
+  for (int i = 0; i < 9; i++) if (pinState[i]) return true;
+  return false;
+}
+
+void checkPhases() {
+  bool curA = (digitalRead(PHASE_A) == LOW);
+  bool curB = (digitalRead(PHASE_B) == LOW);
+  bool curC = (digitalRead(PHASE_C) == LOW);
+
+  if (curA != lastReadA || curB != lastReadB || curC != lastReadC) {
+    phaseDebounceTimer = millis();
+    lastReadA = curA;
+    lastReadB = curB;
+    lastReadC = curC;
+  }
+  else if ((millis() - phaseDebounceTimer) > PHASE_DEBOUNCE) {
+    if (curA != stablePhaseA || curB != stablePhaseB || curC != stablePhaseC) {
+      stablePhaseA = curA;
+      stablePhaseB = curB;
+      stablePhaseC = curC;
+
+      if (callActive || anyOutputBusy() || smsBusy) {
+        phaseSMSPending = true;
+      } else {
+        sendSMSToAll(buildPhaseStatus());
+      }
+    }
+  }
+}
+
+void tryFlushPendingSMS() {
+  if (phaseSMSPending && !callActive && !anyOutputBusy() && !smsBusy) {
+    phaseSMSPending = false;
+    sendSMSToAll(buildPhaseStatus());
+  }
+}
+
+String buildPhaseStatus() {
+  String smsBody = String(DEVICE_ADDRESS) + "\n";
+  smsBody += "СТАТУС ФАЗ:\n";
+  smsBody += "Фаза A: " + String(stablePhaseA ? "ОК (220В)" : "АВАРИЯ (ВЫКЛ)") + "\n";
+  smsBody += "Фаза B: " + String(stablePhaseB ? "ОК (220В)" : "АВАРИЯ (ВЫКЛ)") + "\n";
+  smsBody += "Фаза C: " + String(stablePhaseC ? "ОК (220В)" : "АВАРИЯ (ВЫКЛ)");
+  return smsBody;
+}
+
+bool isNumberAllowed(String incoming) {
+  int q1 = incoming.indexOf('"');
+  int q2 = incoming.indexOf('"', q1 + 1);
+  if (q1 < 0 || q2 < 0) return false;
+
+  String raw = incoming.substring(q1 + 1, q2);
+  String clean = "";
+  for (unsigned int i = 0; i < raw.length(); i++) {
+    if (isDigit(raw.charAt(i))) clean += raw.charAt(i);
+  }
+  if (clean.length() == 11 && clean.startsWith("8")) {
+    clean = "7" + clean.substring(1);
+  }
+
+  for (int i = 0; i < ALLOWED_COUNT; i++) {
+    if (clean == ALLOWED[i]) return true;
+  }
+  return false;
+}
+
+void handleDTMF(char d) {
+  if (!callActive) return;
+  if (millis() - lastDTMF < DTMF_GUARD) return;
+  lastDTMF = millis();
+
+  if (d == '*') {
+    sendAT("ATH");
+    callActive = false;
+    stopAmr();
+    return;
+  }
+
+  if (menu == ROOT_MENU) {
+    if (d == '1') { menu = MENU_A; playAmr(2); return; }
+#if SCREEN_COUNT >= 2
+    if (d == '2') { menu = MENU_B; playAmr(3); return; }
+#else
+    // Экран B не настроен (SCREEN_COUNT < 2) — вместо тишины
+    // проигрываем файл "недоступно", меню остаётся в ROOT_MENU.
+    if (d == '2') { playAmr(6); return; }
+#endif
+#if SCREEN_COUNT >= 3
+    if (d == '3') { menu = MENU_C; playAmr(5); return; }
+#else
+    // Экран C не настроен (SCREEN_COUNT < 3) — та же заглушка.
+    if (d == '3') { playAmr(6); return; }
+#endif
+    return;
+  }
+
+  if (menu == MENU_A) {
+    if (d == '1') { pulseOutput(0, TIMEOUT_SCREEN);   playAmr(4); return; }
+    if (d == '2') { pulseOutput(1, PULSE_PC_SHORT);   playAmr(4); return; }
+    if (d == '3') { pulseOutput(2, PULSE_PC_SHORT);   playAmr(4); return; }
+    if (d == '0') { menu = ROOT_MENU; playAmr(1); }
+    return;
+  }
+
+#if SCREEN_COUNT >= 2
+  if (menu == MENU_B) {
+    if (d == '1') { pulseOutput(3, TIMEOUT_SCREEN);   playAmr(4); return; }
+    if (d == '2') { pulseOutput(4, PULSE_PC_SHORT);   playAmr(4); return; }
+    if (d == '3') { pulseOutput(5, PULSE_PC_SHORT);   playAmr(4); return; }
+    if (d == '0') { menu = ROOT_MENU; playAmr(1); }
+    return;
+  }
+#endif
+
+#if SCREEN_COUNT >= 3
+  if (menu == MENU_C) {
+    if (d == '1') { pulseOutput(6, TIMEOUT_SCREEN);   playAmr(4); return; }
+    if (d == '2') { pulseOutput(7, PULSE_PC_SHORT);   playAmr(4); return; }
+    if (d == '3') { pulseOutput(8, PULSE_PC_SHORT);   playAmr(4); return; }
+    if (d == '0') { menu = ROOT_MENU; playAmr(1); }
+  }
+#endif
+}
+
+void pulseOutput(int index, unsigned long duration) {
+  relayOn(index);
+  pinState[index]    = true;
+  pinTimer[index]    = millis();
+  pinDuration[index] = duration;
+}
+
+void outputHandler() {
+  for (int i = 0; i < 9; i++) {
+    if (!pinState[i]) continue;
+    if (millis() - pinTimer[i] > pinDuration[i]) {
+      relayOff(i);
+      pinState[i] = false;
+      pinDuration[i] = 0;
+    }
+  }
+}
+
+void checkTimeout() {
+  if (callActive && millis() - callStart > CALL_TIMEOUT) {
+    sendAT("ATH");
+    callActive = false;
+    pendingGreeting = false;
+    stopAmr();
+  }
+}
+
+void sendAT(const char* cmd) {
+  sim800.println(cmd);
+}
+
+// Единая точка остановки воспроизведения — используется во всех
+// обработчиках (обрыв звонка, '*' в DTMF-меню, таймаут звонка, перед
+// стартом нового playAmr()) вместо дублирования "AT+CMEDPLAY=0" в
+// четырёх разных местах.
+void stopAmr() {
+  sendAT("AT+CMEDPLAY=0");
+}
+
+void playAmr(int fileNum) {
+  stopAmr();
+  delay(100);
+  String cmd = "AT+CMEDPLAY=1,\"C:\\User\\000" + String(fileNum) + ".amr\",0,100";
+  sendAT(cmd.c_str());
+}
