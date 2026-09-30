@@ -1,7 +1,7 @@
 /*
 ====================================================================
- PRO FIX v7.5 - ULTIMATE HYBRID FIRMWARE (UNAVAILABLE-SCREEN PROMPT)
- ESP32 + SIM800L (.AMR audio) + 9 RELAYS + MULTI-SMS + WATCHDOG
+ PRO FIX v7.6 - ULTIMATE HYBRID FIRMWARE (GPRS OTA + NVS PHONES)
+ ESP32 + SIM800L (.AMR audio) + 9 RELAYS + MULTI-SMS + WATCHDOG + OTA
  Integrated Features:
   - Non-blocking Unified UART Parser & Async Watchdog
   - Postponed SMS during active call/pulses (No PC hard-off)
@@ -12,9 +12,53 @@
   - Up to three screen/PC groups (A/B/C) — 9 relays total
   - SMS text sent in Russian (Cyrillic), UCS2 + correct DCS
   - DEVICE_ADDRESS text prepended to every phase-status SMS
-  - SCREEN_COUNT compile-time switch to enable 1, 2, or 3 groups
+  - SCREEN_COUNT compile-time switch (1 or 2 screen groups in root menu)
   - Voice feedback ("недоступно") when pressing a screen digit that
     SCREEN_COUNT doesn't have configured
+  - GPRS OTA: SMS "OTA http://host/fw.bin" from an ALLOWED number
+    streams the .bin over SIM800 TCP into the ESP32 OTA partition
+  - Runtime SMS / call phone lists in NVS, edited by SMS commands
+
+ CHANGES vs v7.6-PHONES (3-relay hardware + menu):
+  - Только 3 реле на плате:
+      GPIO25 (реле 1) = ПК экрана 1 (одна кнопка Power)
+      GPIO26 (реле 2) = ПК экрана 2 (одна кнопка Power)
+      GPIO32 (реле 4) = интернет + камеры (power cycle 60 с)
+  - Подменю экрана: 1 = короткий импульс Power (вкл/выкл),
+    2 = длинный импульс Power 5 с (принудительная перезагрузка)
+  - ROOT: 1/2 = подменю экранов, 3 = интернет/камеры 60 с
+  - ROOT voice (0001.amr): «Экран 1 нажмите один, экран 2 нажмите два,
+    перезагрузка интернета и камеры нажмите три»
+  - Submenu (0002/0003.amr): «Включить или выключить ПК нажмите один,
+    Перезагрузить ПК нажмите два»
+  - Нужны перезаписанные 0001.amr, 0002.amr, 0003.amr на SIM800L
+
+ CHANGES vs v7.6-OTA:
+  - ADDED: SMS/call phone lists live in ESP32 NVS (Preferences),
+    seeded once from the compile-time TARGET_PHONES / ALLOWED arrays.
+    Survive reboot and OTA. SMS commands (sender must be on CALL list):
+      ADD SMS +79... / DEL SMS +79...
+      ADD CALL +79... / DEL CALL +79...
+      LIST / LIST SMS / LIST CALL
+      RESET PHONES   (restore factory arrays)
+      HELP
+    Last CALL number cannot be deleted (lockout protection).
+
+ CHANGES vs v7.5:
+  - ADDED: over-the-air firmware update via SIM800L GPRS (no WiFi).
+    SIM800 HTTP-to-RAM (AT+HTTPACTION) cannot hold a 1MB+ ESP32
+    image, so the downloader uses AT+CIPSTART + AT+CIPRXGET=1 and
+    writes chunks with Update.write(). First firmware install is
+    still USB; every later build can be pushed by SMS.
+  - ADDED: incoming SMS handling (AT+CNMI / AT+CMGR). Commands:
+      OTA http://host[:port]/path.bin  — start update (HTTP only)
+      VER                              — reply with FW_VERSION
+    Sender must be on the ALLOWED whitelist. HTTPS is rejected
+    (SIM800 TLS is unreliable and not used here).
+  - ADDED: GPRS_APN / GPRS_USER / GPRS_PASS compile-time APN.
+    Change per site/operator before flashing.
+  - Watchdog / call handling paused while otaBusy to avoid UART
+    collisions with the binary TCP stream.
 
  CHANGES vs v7.4:
   - ADDED: a 6th voice prompt file is now needed on the modem's
@@ -78,8 +122,10 @@
 
 #include <Arduino.h>
 #include <HardwareSerial.h>
+#include <Update.h>
+#include <Preferences.h>
 
-#define FW_VERSION "v7.5-ULTIMATE"
+#define FW_VERSION "v7.7-3RELAY-CFG"
 
 // ================= SIM800 =================
 HardwareSerial sim800(2);
@@ -87,18 +133,16 @@ HardwareSerial sim800(2);
 #define SIM800_RX_PIN    16
 #define SIM800_TX_PIN    17
 
-// ================= RELAYS (9 КАНАЛОВ) =================
-#define RELAY_SCREEN_A   25     // Реле 1: Питание Экрана А (220V)
-#define RELAY_PC_A_PWR   26     // Реле 2: ПК А Power SW
-#define RELAY_PC_A_RST   27     // Реле 3: ПК А Reset SW
+// ================= RELAYS (3 канала — фактическая схема платы) =================
+// Реле 1 → GPIO25 → Экран 1: одна кнопка Power ПК
+//   короткое нажатие = вкл/выкл, длинное = принудительная перезагрузка
+// Реле 2 → GPIO26 → Экран 2: то же
+// Реле 4 → GPIO32 → Перезагрузка интернета и камер (питание 60 сек)
+#define RELAY_PC_1       25     // Реле 1: ПК экрана 1 (Power SW)
+#define RELAY_PC_2       26     // Реле 2: ПК экрана 2 (Power SW)
+#define RELAY_INET_CAM   32     // Реле 4: интернет + камеры (220V power cycle)
 
-#define RELAY_SCREEN_B   32     // Реле 4: Питание Экрана Б (220V)
-#define RELAY_PC_B_PWR   33     // Реле 5: ПК Б Power SW
-#define RELAY_PC_B_RST   13     // Реле 6: ПК Б Reset SW (GPIO13)
-
-#define RELAY_SCREEN_C   14     // Реле 7: Питание Экрана С (220V)
-#define RELAY_PC_C_PWR   18     // Реле 8: ПК С Power SW
-#define RELAY_PC_C_RST   19     // Реле 9: ПК С Reset SW
+#define RELAY_COUNT      3
 
 // Логика работы реле: 1 = Active-HIGH (HIGH = вкл), 0 = Active-LOW (LOW = вкл)
 #define RELAY_ACTIVE_HIGH 1
@@ -109,8 +153,15 @@ HardwareSerial sim800(2);
 #define PHASE_C 23
 
 // ================= TIMINGS ===============
-#define TIMEOUT_SCREEN     60000UL  // Перезагрузка питания экрана (60 сек)
-#define PULSE_PC_SHORT       500UL  // Импульс кнопки ПК (0.5 сек)
+#define TIMEOUT_INET_CAM   60000UL  // Перезагрузка интернета/камер (60 сек)
+#define PULSE_PC_SHORT       500UL  // Короткий импульс Power = вкл/выкл ПК (фиксированный)
+#define PULSE_PC_LONG_DEF   5000UL  // Заводское значение длинного импульса (мс)
+#define PULSE_PC_LONG_MIN   1000UL  // Минимум для SET LONG (1 с)
+#define PULSE_PC_LONG_MAX  30000UL  // Максимум для SET LONG (30 с)
+
+// Runtime: длительность длинного Power-импульса (перезагрузка ПК).
+// Меняется по SMS: SET LONG 5000 / GET LONG. Хранится в NVS.
+unsigned long pulsePcLong = PULSE_PC_LONG_DEF;
 
 #define DTMF_GUARD           600UL
 #define CALL_TIMEOUT      180000UL
@@ -126,20 +177,31 @@ HardwareSerial sim800(2);
 #define DENIED_SMS_COOLDOWN 600000UL // Не уведомлять о чужих звонках чаще 10 мин
 #define CREG_POLL_TMO        1500UL
 
+// ================= GPRS / OTA =================
+// APN оператора SIM-карты. Типичные значения:
+//   МТС      internet.mts.ru
+//   Билайн   internet.beeline.ru
+//   МегаФон  internet
+//   Tele2    internet.tele2.ru
+#define GPRS_APN  "internet"
+#define GPRS_USER ""
+#define GPRS_PASS ""
+
+#define OTA_CHUNK_SIZE     512
+#define OTA_MAX_BYTES      (1536UL * 1024UL)
+#define OTA_HDR_MAX        1024
+#define OTA_TOTAL_TMO      600000UL
+
 // ================= КОЛИЧЕСТВО ПОДКЛЮЧЁННЫХ ЭКРАНОВ =================
-// Сколько групп "экран + ПК" физически подключено и должно работать:
-// 1 = только группа A (реле 1-3)
-// 2 = группы A и B (реле 1-6)
-// 3 = все три группы A, B, C (реле 1-9)
-// Это НЕ влияет на аудиофайлы — все они (0001-0005.amr) остаются
-// залитыми на SIM800L в любом случае. Меняется только то, реагирует
-// ли DTMF-меню на цифры "2"/"3" в корневом меню — при SCREEN_COUNT=1
-// или 2 соответствующие пункты меню просто не компилируются и лишний
-// звонок "не туда" никак не сработает.
+// 1 = только экран 1 (реле GPIO25)
+// 2 = экран 1 + экран 2 (GPIO25 + GPIO26)
+// Кнопка 3 в корне всегда: перезагрузка интернета и камер (GPIO32, 60 сек)
+// Аудио: 0001–0004.amr и 0006.amr на SIM800L.
+// При SCREEN_COUNT=1 нажатие «2» → 0006.amr («недоступно»).
 #define SCREEN_COUNT 2
 
-#if (SCREEN_COUNT < 1) || (SCREEN_COUNT > 3)
-  #error "SCREEN_COUNT must be 1, 2 or 3"
+#if (SCREEN_COUNT < 1) || (SCREEN_COUNT > 2)
+  #error "SCREEN_COUNT must be 1 or 2"
 #endif
 
 // ================= АДРЕС УСТАНОВКИ УСТРОЙСТВА =================
@@ -156,31 +218,39 @@ HardwareSerial sim800(2);
 // прошивке не реализована, так что модем либо обрежет лишнее, либо
 // отправит несколько отдельных SMS без индикации "1/2, 2/2". Старайтесь
 // укладываться в разумную длину, например 40-50 символов.
-#define DEVICE_ADDRESS "Ленина пр.-ул.Завенягина"
+#define DEVICE_ADDRESS "Блюхера-Дарвина"
 
-// ================= НОМЕРА ДЛЯ СМС =================
+// ================= НОМЕРА ДЛЯ СМС (заводской список) =================
 const char* TARGET_PHONES[] = {
-  "+79514629028",
-  "+79080810209",
-  "+79028955702",
-  "+79617959935",
-  "+79514344144"
+  "+79514629028"
+//  "+79080810209",
+//  "+79028955702",
+//  "+79617959935",
+//  "+79514344144"
 };
 const int TARGET_COUNT = sizeof(TARGET_PHONES) / sizeof(TARGET_PHONES[0]);
 
-// ================= БЕЛЫЙ СПИСОК ЗВОНКОВ =================
+// ================= БЕЛЫЙ СПИСОК ЗВОНКОВ (заводской список) =================
 const char* ALLOWED[] = {
-  "79514629028",
-  "79000284997",
-  "79925289148",
-  "79080810209",
-  "79028955702",
-  "79080812620",
-  "79823341420",
-  "79514344144",
-  "79617959935"
+  "79514629028"
+//  "79000284997",
+//  "79925289148",
+//  "79080810209",
+//  "79028955702",
+//  "79080812620",
+//  "79823341420",
+//  "79514344144",
+//  "79617959935"
 };
 const int ALLOWED_COUNT = sizeof(ALLOWED) / sizeof(ALLOWED[0]);
+
+#define PHONE_MAX 16
+char smsList[PHONE_MAX][16];
+char callList[PHONE_MAX][16];
+int smsCount = 0;
+int callCount = 0;
+Preferences phonePrefs;
+Preferences cfgPrefs;
 
 // ================= STATE ==================
 enum MenuState { ROOT_MENU, MENU_A, MENU_B, MENU_C };
@@ -200,6 +270,11 @@ bool phaseSMSPending = false;
 bool reinitPending   = false;
 bool cfunPending     = false;
 bool smsBusy         = false;
+bool otaBusy         = false;
+bool otaPending      = false;
+int  pendingSmsIndex = -1;
+String otaUrl;
+String otaRequester;
 
 // Неблокирующее приветствие после ответа на звонок
 bool pendingGreeting       = false;
@@ -222,16 +297,19 @@ bool smsDoneFlag              = false;
 bool smsSuccessFlag           = false;
 static bool cfgAppliedOnce    = false;
 
-// ================= HARDWARE MAP =================
-const byte outputPins[9] = {
-  RELAY_SCREEN_A, RELAY_PC_A_PWR, RELAY_PC_A_RST,
-  RELAY_SCREEN_B, RELAY_PC_B_PWR, RELAY_PC_B_RST,
-  RELAY_SCREEN_C, RELAY_PC_C_PWR, RELAY_PC_C_RST
+// ================= HARDWARE MAP (3 реле) =================
+// [0] = ПК экрана 1 (GPIO25)
+// [1] = ПК экрана 2 (GPIO26)
+// [2] = интернет + камеры (GPIO32)
+const byte outputPins[RELAY_COUNT] = {
+  RELAY_PC_1,
+  RELAY_PC_2,
+  RELAY_INET_CAM
 };
 
-bool          pinState[9]    = {0};
-unsigned long pinTimer[9]    = {0};
-unsigned long pinDuration[9] = {0};
+bool          pinState[RELAY_COUNT]    = {0};
+unsigned long pinTimer[RELAY_COUNT]    = {0};
+unsigned long pinDuration[RELAY_COUNT] = {0};
 
 // Прототипы функций
 void relayOn(byte i);
@@ -262,6 +340,32 @@ void sendAT(const char* cmd);
 void stopAmr();
 void playAmr(int fileNum);
 void serviceGreeting();
+String extractQuoted(const String& s, int nth);
+String digitsOnly(const String& raw);
+bool isPhoneAllowed(const String& digits);
+String toSmsNumber(const String& digits);
+String maybeUcs2HexToText(const String& s);
+bool waitModemToken(const char* token, uint32_t tmo);
+bool readExactly(uint8_t* buf, int n, uint32_t tmo);
+bool parseHttpUrl(const String& url, String& host, int& port, String& path);
+bool gprsAttach();
+void gprsShutdown();
+bool tcpOpen(const String& host, int port);
+int  cipRead(uint8_t* buf, int maxN, int& remaining);
+void processIncomingSms(int index);
+void performOta();
+void normalizePhone(char* dst, const char* src);
+int findPhone(char list[][16], int count, const char* digits);
+bool phonesSave();
+void phonesSeedFactory();
+void phonesLoad();
+bool phonesAdd(char list[][16], int& count, const char* digits);
+bool phonesDel(char list[][16], int& count, const char* digits, bool keepLast);
+String listPhones(char list[][16], int count, bool plus);
+String handlePhoneCommand(const String& upper, const String& cmdLine);
+void cfgLoad();
+bool cfgSave();
+String handleCfgCommand(const String& upper, const String& cmdLine);
 
 // =====================================================
 // SETUP
@@ -277,7 +381,7 @@ void setup() {
   pinMode(PHASE_B, INPUT_PULLUP);
   pinMode(PHASE_C, INPUT_PULLUP);
 
-  for (int i = 0; i < 9; i++) {
+  for (int i = 0; i < RELAY_COUNT; i++) {
     pinMode(outputPins[i], OUTPUT);
     relayOff(i);
   }
@@ -292,6 +396,9 @@ void setup() {
   sim800.begin(9600, SERIAL_8N1, SIM800_RX_PIN, SIM800_TX_PIN);
   delay(1000);
 
+  phonesLoad();
+  cfgLoad();
+
   initSIM();
 
   // Версия прошивки (FW_VERSION) больше не подставляется в текст SMS —
@@ -300,7 +407,7 @@ void setup() {
   String bootMsg = "СИСТЕМА ЗАПУЩЕНА\r\n" + buildPhaseStatus();
   sendSMSToAll(bootMsg);
 
-  Serial.println(F("PRO FIX v7.5 ULTIMATE READY"));
+  Serial.println(F("PRO FIX v7.7-3RELAY-CFG READY"));
 }
 
 // =====================================================
@@ -308,16 +415,27 @@ void setup() {
 // =====================================================
 void loop() {
   readSIM();          // Единый неблокирующий чтец UART
-  runWatchdog();      // Фоновый планировщик
+  if (!otaBusy) runWatchdog();
   outputHandler();
   checkTimeout();
   checkPhases();
   serviceGreeting();  // Неблокирующее проигрывание приветствия
 
-  if (reinitPending) {
+  if (pendingSmsIndex >= 0 && !callActive && !smsBusy && !otaBusy) {
+    int idx = pendingSmsIndex;
+    pendingSmsIndex = -1;
+    processIncomingSms(idx);
+  }
+
+  if (otaPending && !callActive && !anyOutputBusy() && !smsBusy && !otaBusy) {
+    otaPending = false;
+    performOta();
+  }
+
+  if (reinitPending && !otaBusy) {
     reinitPending = false;
     initSIM();
-  } else if (cfunPending) {
+  } else if (cfunPending && !otaBusy) {
     cfunPending = false;
     resetSIMNetwork();
   }
@@ -347,7 +465,7 @@ void pumpLines() {
 void readSIM() { pumpLines(); }
 
 void handleLine(String line) {
-  Serial.println(line);
+  if (!otaBusy) Serial.println(line);
 
   if (line.equals("OK")) {
     lastModemOK = millis();
@@ -381,10 +499,22 @@ void handleLine(String line) {
       line.indexOf("UNDER-VOLTAGE")   >= 0 ||
       line.indexOf("UNDER VOLTAGE")   >= 0) {
     Serial.println(F("[POWER] Power drop detected on SIM800L!"));
-    if (!reinitPending && !smsBusy) reinitPending = true;
+    if (!reinitPending && !smsBusy && !otaBusy) reinitPending = true;
+  }
+
+  // +CMTI: "SM",N  /  +CMTI: "ME",N — новая SMS
+  if (line.indexOf("+CMTI:") >= 0) {
+    int comma = line.lastIndexOf(',');
+    if (comma >= 0) {
+      pendingSmsIndex = line.substring(comma + 1).toInt();
+      Serial.print(F("[SMS] Incoming index "));
+      Serial.println(pendingSmsIndex);
+    }
+    return;
   }
 
   if (line.indexOf("+CLIP") >= 0) {
+    if (otaBusy) return;
     if (callActive) return;
     if (isNumberAllowed(line)) {
       // Здесь НЕ используем delay(200)/delay(1500) — они блокируют
@@ -589,8 +719,8 @@ bool sendSMS(const String& number, const String& body) {
 }
 
 void sendSMSToAll(const String& body) {
-  for (int i = 0; i < TARGET_COUNT; i++) {
-    sendSMS(String(TARGET_PHONES[i]), body);
+  for (int i = 0; i < smsCount; i++) {
+    sendSMS(toSmsNumber(String(smsList[i])), body);
     delay(1500);
   }
 }
@@ -601,6 +731,8 @@ void configureModem() {
   sendAT("AT+DDET=1,100,0,0"); waitOK(1000);
   sendAT("AT+DTAM=2");          waitOK(1000);
   sendAT("AT+CMGF=1");          waitOK(1000);
+  sendAT("AT+CNMI=2,1,0,0,0");  waitOK(1000);
+  sendAT("AT+CPMS=\"SM\",\"SM\",\"SM\""); waitOK(1000);
   // Уровни громкости — судя по всему, именно этих двух команд не хватало
   // раньше: AT+CRSL — громкость звонка, AT+CLVL — громкость динамика/
   // разговорного тракта. Подтверждено рабочим тестом на реальном звонке.
@@ -649,6 +781,7 @@ void initSIM() {
 
 void runWatchdog() {
   unsigned long now = millis();
+  if (otaBusy) return;
 
   if (!smsBusy) {
     if (now - lastPingT > WDG_PING_EVERY) {
@@ -683,7 +816,7 @@ void resetSIMNetwork() {
 }
 
 bool anyOutputBusy() {
-  for (int i = 0; i < 9; i++) if (pinState[i]) return true;
+  for (int i = 0; i < RELAY_COUNT; i++) if (pinState[i]) return true;
   return false;
 }
 
@@ -743,12 +876,27 @@ bool isNumberAllowed(String incoming) {
     clean = "7" + clean.substring(1);
   }
 
-  for (int i = 0; i < ALLOWED_COUNT; i++) {
-    if (clean == ALLOWED[i]) return true;
-  }
-  return false;
+  return isPhoneAllowed(clean);
 }
 
+// Меню (голосовые подсказки — файлы .amr на SIM800L):
+//   0001.amr (ROOT): «Экран 1 нажмите один, экран 2 нажмите два,
+//                    перезагрузка интернета и камеры нажмите три»
+//   0002.amr (MENU_A / экран 1): «Включить или выключить ПК нажмите один,
+//                                 Перезагрузить ПК нажмите два»
+//   0003.amr (MENU_B / экран 2): то же для экрана 2
+//   0004.amr — подтверждение действия
+//   0006.amr — «недоступно» (если SCREEN_COUNT < 2 и нажали 2)
+//
+// Корневое меню:
+//   1 → подменю экрана 1 (реле GPIO25)
+//   2 → подменю экрана 2 (реле GPIO26), если SCREEN_COUNT >= 2
+//   3 → перезагрузка интернета и камер (реле GPIO32, 60 сек)
+// Подменю экрана 1 / 2 (одна кнопка Power на реле):
+//   1 → вкл/выкл ПК (короткий импульс Power SW, 0.5 с)
+//   2 → перезагрузка ПК (длинный импульс Power SW, 5 с)
+//   0 → назад в корневое меню
+//   * → сброс звонка
 void handleDTMF(char d) {
   if (!callActive) return;
   if (millis() - lastDTMF < DTMF_GUARD) return;
@@ -762,47 +910,47 @@ void handleDTMF(char d) {
   }
 
   if (menu == ROOT_MENU) {
+    // 1 — Экран 1 → подменю (реле GPIO25)
     if (d == '1') { menu = MENU_A; playAmr(2); return; }
+
 #if SCREEN_COUNT >= 2
+    // 2 — Экран 2 → подменю (реле GPIO26)
     if (d == '2') { menu = MENU_B; playAmr(3); return; }
 #else
-    // Экран B не настроен (SCREEN_COUNT < 2) — вместо тишины
-    // проигрываем файл "недоступно", меню остаётся в ROOT_MENU.
+    // Экран 2 не настроен — «недоступно», остаёмся в ROOT_MENU
     if (d == '2') { playAmr(6); return; }
 #endif
-#if SCREEN_COUNT >= 3
-    if (d == '3') { menu = MENU_C; playAmr(5); return; }
-#else
-    // Экран C не настроен (SCREEN_COUNT < 3) — та же заглушка.
-    if (d == '3') { playAmr(6); return; }
-#endif
+
+    // 3 — Перезагрузка интернета и камер (реле GPIO32, 60 сек)
+    if (d == '3') {
+      pulseOutput(2, TIMEOUT_INET_CAM);
+      playAmr(4);
+      return;
+    }
     return;
   }
 
+  // Подменю экрана 1 — реле [0] = GPIO25
   if (menu == MENU_A) {
-    if (d == '1') { pulseOutput(0, TIMEOUT_SCREEN);   playAmr(4); return; }
-    if (d == '2') { pulseOutput(1, PULSE_PC_SHORT);   playAmr(4); return; }
-    if (d == '3') { pulseOutput(2, PULSE_PC_SHORT);   playAmr(4); return; }
+    // 1 — Вкл/выкл ПК (короткий импульс)
+    if (d == '1') { pulseOutput(0, PULSE_PC_SHORT); playAmr(4); return; }
+    // 2 — Перезагрузка ПК (длинный импульс Power, длительность из NVS / SMS)
+    if (d == '2') { pulseOutput(0, pulsePcLong); playAmr(4); return; }
+    // 0 — назад в корневое меню
     if (d == '0') { menu = ROOT_MENU; playAmr(1); }
     return;
   }
 
 #if SCREEN_COUNT >= 2
+  // Подменю экрана 2 — реле [1] = GPIO26
   if (menu == MENU_B) {
-    if (d == '1') { pulseOutput(3, TIMEOUT_SCREEN);   playAmr(4); return; }
-    if (d == '2') { pulseOutput(4, PULSE_PC_SHORT);   playAmr(4); return; }
-    if (d == '3') { pulseOutput(5, PULSE_PC_SHORT);   playAmr(4); return; }
+    // 1 — Вкл/выкл ПК (короткий импульс)
+    if (d == '1') { pulseOutput(1, PULSE_PC_SHORT); playAmr(4); return; }
+    // 2 — Перезагрузка ПК (длинный импульс Power, длительность из NVS / SMS)
+    if (d == '2') { pulseOutput(1, pulsePcLong); playAmr(4); return; }
+    // 0 — назад в корневое меню
     if (d == '0') { menu = ROOT_MENU; playAmr(1); }
     return;
-  }
-#endif
-
-#if SCREEN_COUNT >= 3
-  if (menu == MENU_C) {
-    if (d == '1') { pulseOutput(6, TIMEOUT_SCREEN);   playAmr(4); return; }
-    if (d == '2') { pulseOutput(7, PULSE_PC_SHORT);   playAmr(4); return; }
-    if (d == '3') { pulseOutput(8, PULSE_PC_SHORT);   playAmr(4); return; }
-    if (d == '0') { menu = ROOT_MENU; playAmr(1); }
   }
 #endif
 }
@@ -815,7 +963,7 @@ void pulseOutput(int index, unsigned long duration) {
 }
 
 void outputHandler() {
-  for (int i = 0; i < 9; i++) {
+  for (int i = 0; i < RELAY_COUNT; i++) {
     if (!pinState[i]) continue;
     if (millis() - pinTimer[i] > pinDuration[i]) {
       relayOff(i);
@@ -851,4 +999,810 @@ void playAmr(int fileNum) {
   delay(100);
   String cmd = "AT+CMEDPLAY=1,\"C:\\User\\000" + String(fileNum) + ".amr\",0,100";
   sendAT(cmd.c_str());
+}
+
+String extractQuoted(const String& s, int nth) {
+  int from = 0;
+  for (int n = 0; n <= nth; n++) {
+    int q1 = s.indexOf('"', from);
+    if (q1 < 0) return "";
+    int q2 = s.indexOf('"', q1 + 1);
+    if (q2 < 0) return "";
+    if (n == nth) return s.substring(q1 + 1, q2);
+    from = q2 + 1;
+  }
+  return "";
+}
+
+String digitsOnly(const String& raw) {
+  String clean = "";
+  for (unsigned int i = 0; i < raw.length(); i++) {
+    if (isDigit(raw.charAt(i))) clean += raw.charAt(i);
+  }
+  if (clean.length() == 11 && clean.startsWith("8")) {
+    clean = "7" + clean.substring(1);
+  }
+  return clean;
+}
+
+bool isPhoneAllowed(const String& digits) {
+  for (int i = 0; i < callCount; i++) {
+    if (digits == callList[i]) return true;
+  }
+  return false;
+}
+
+String toSmsNumber(const String& digits) {
+  if (digits.length() == 0) return "";
+  if (digits.charAt(0) == '+') return digits;
+  if (digits.length() == 11 && digits.startsWith("7")) return "+" + digits;
+  return "+" + digits;
+}
+
+String maybeUcs2HexToText(const String& s) {
+  String t = s;
+  t.trim();
+  if (t.length() < 8 || (t.length() % 4) != 0) return s;
+  for (unsigned int i = 0; i < t.length(); i++) {
+    char c = t.charAt(i);
+    bool hex = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
+    if (!hex) return s;
+  }
+  String out = "";
+  for (unsigned int i = 0; i + 3 < t.length(); i += 4) {
+    int cp = (int)strtol(t.substring(i, i + 4).c_str(), nullptr, 16);
+    if (cp == 0) continue;
+    if (cp < 128) {
+      out += (char)cp;
+    } else if (cp < 0x800) {
+      out += (char)(0xC0 | (cp >> 6));
+      out += (char)(0x80 | (cp & 0x3F));
+    } else {
+      out += (char)(0xE0 | (cp >> 12));
+      out += (char)(0x80 | ((cp >> 6) & 0x3F));
+      out += (char)(0x80 | (cp & 0x3F));
+    }
+  }
+  return out.length() ? out : s;
+}
+
+bool waitModemToken(const char* token, uint32_t tmo) {
+  unsigned long t = millis();
+  String acc;
+  while (millis() - t < tmo) {
+    while (sim800.available()) {
+      char c = (char)sim800.read();
+      if (c == '\r') continue;
+      if (c == '\n') {
+        acc.trim();
+        if (acc.length() > 0) {
+          Serial.println(acc);
+          if (acc.indexOf(token) >= 0) return true;
+          if (acc.indexOf("ERROR") >= 0) return false;
+          if (acc.indexOf("FAIL") >= 0) return false;
+        }
+        acc = "";
+      } else {
+        acc += c;
+      }
+    }
+  }
+  return false;
+}
+
+bool readExactly(uint8_t* buf, int n, uint32_t tmo) {
+  int got = 0;
+  unsigned long t = millis();
+  while (got < n && (millis() - t) < tmo) {
+    if (sim800.available()) {
+      buf[got++] = (uint8_t)sim800.read();
+    }
+  }
+  return got == n;
+}
+
+bool parseHttpUrl(const String& url, String& host, int& port, String& path) {
+  String u = url;
+  u.trim();
+  if (u.startsWith("https://") || u.startsWith("HTTPS://")) return false;
+  if (u.startsWith("HTTP://")) u = "http://" + u.substring(7);
+  if (!u.startsWith("http://")) return false;
+  u = u.substring(7);
+  int slash = u.indexOf('/');
+  String hp;
+  if (slash < 0) {
+    hp = u;
+    path = "/";
+  } else {
+    hp = u.substring(0, slash);
+    path = u.substring(slash);
+  }
+  int colon = hp.indexOf(':');
+  if (colon >= 0) {
+    host = hp.substring(0, colon);
+    port = hp.substring(colon + 1).toInt();
+    if (port <= 0) port = 80;
+  } else {
+    host = hp;
+    port = 80;
+  }
+  return host.length() > 0;
+}
+
+bool gprsAttach() {
+  sendAT("AT+CIPSHUT");
+  waitModemToken("SHUT OK", 8000);
+
+  sendAT("AT+CIPMUX=0");
+  if (!waitOK(2000)) return false;
+
+  sendAT("AT+CIPRXGET=1");
+  if (!waitOK(2000)) return false;
+
+  sendAT("AT+CGATT=1");
+  waitOK(8000);
+
+  String cstt = String("AT+CSTT=\"") + GPRS_APN + "\",\"" + GPRS_USER + "\",\"" + GPRS_PASS + "\"";
+  sendAT(cstt.c_str());
+  waitOK(5000);
+
+  sendAT("AT+CIICR");
+  if (!waitOK(20000)) {
+    Serial.println(F("[OTA] CIICR failed"));
+    return false;
+  }
+
+  sim800.println("AT+CIFSR");
+  unsigned long t = millis();
+  bool gotIp = false;
+  String acc;
+  while (millis() - t < 5000) {
+    while (sim800.available()) {
+      char c = (char)sim800.read();
+      if (c == '\r') continue;
+      if (c == '\n') {
+        acc.trim();
+        if (acc.length() > 0) {
+          Serial.println(acc);
+          if (acc.indexOf('.') > 0 && acc.indexOf("ERROR") < 0) gotIp = true;
+        }
+        acc = "";
+      } else {
+        acc += c;
+      }
+    }
+    if (gotIp) break;
+  }
+  return gotIp;
+}
+
+void gprsShutdown() {
+  sendAT("AT+CIPCLOSE");
+  waitModemToken("CLOSE OK", 3000);
+  sendAT("AT+CIPSHUT");
+  waitModemToken("SHUT OK", 5000);
+}
+
+bool tcpOpen(const String& host, int port) {
+  String cmd = "AT+CIPSTART=\"TCP\",\"" + host + "\",\"" + String(port) + "\"";
+  sendAT(cmd.c_str());
+  unsigned long t = millis();
+  String acc;
+  while (millis() - t < 40000) {
+    while (sim800.available()) {
+      char c = (char)sim800.read();
+      if (c == '\r') continue;
+      if (c == '\n') {
+        acc.trim();
+        if (acc.length() > 0) {
+          Serial.println(acc);
+          if (acc.indexOf("CONNECT OK") >= 0) return true;
+          if (acc.indexOf("ALREADY CONNECT") >= 0) return true;
+          if (acc.indexOf("CONNECT FAIL") >= 0) return false;
+          if (acc.indexOf("ERROR") >= 0) return false;
+        }
+        acc = "";
+      } else {
+        acc += c;
+      }
+    }
+  }
+  return false;
+}
+
+int cipRead(uint8_t* buf, int maxN, int& remaining) {
+  remaining = 0;
+  sim800.print(F("AT+CIPRXGET=2,"));
+  sim800.println(maxN);
+
+  unsigned long t = millis();
+  String acc;
+  int actual = -1;
+  while (millis() - t < 8000) {
+    while (sim800.available()) {
+      char c = (char)sim800.read();
+      if (c == '\r') continue;
+      if (c == '\n') {
+        acc.trim();
+        if (acc.startsWith("+CIPRXGET: 2,")) {
+          int c1 = acc.indexOf(',');
+          int c2 = acc.indexOf(',', c1 + 1);
+          if (c1 >= 0) {
+            if (c2 > c1) {
+              actual = acc.substring(c1 + 1, c2).toInt();
+              remaining = acc.substring(c2 + 1).toInt();
+            } else {
+              actual = acc.substring(c1 + 1).toInt();
+              remaining = 0;
+            }
+          }
+          goto gotHeader;
+        }
+        if (acc.indexOf("ERROR") >= 0) return -1;
+        if (acc.indexOf("CLOSED") >= 0) return -2;
+        acc = "";
+      } else {
+        acc += c;
+      }
+    }
+  }
+  return -1;
+
+gotHeader:
+  if (actual <= 0) {
+    waitOK(1500);
+    return 0;
+  }
+  if (actual > maxN) actual = maxN;
+  if (!readExactly(buf, actual, 8000)) return -1;
+  waitOK(2000);
+  return actual;
+}
+
+void normalizePhone(char* dst, const char* src) {
+  char tmp[16];
+  int n = 0;
+  for (int i = 0; src[i] && n < 15; i++) {
+    if (src[i] >= '0' && src[i] <= '9') tmp[n++] = src[i];
+  }
+  tmp[n] = 0;
+  if (n == 11 && tmp[0] == '8') tmp[0] = '7';
+  strncpy(dst, tmp, 15);
+  dst[15] = 0;
+}
+
+int findPhone(char list[][16], int count, const char* digits) {
+  for (int i = 0; i < count; i++) {
+    if (strcmp(list[i], digits) == 0) return i;
+  }
+  return -1;
+}
+
+bool phonesSave() {
+  if (!phonePrefs.begin("phones", false)) return false;
+  phonePrefs.putUChar("smsN", (uint8_t)smsCount);
+  phonePrefs.putUChar("callN", (uint8_t)callCount);
+  phonePrefs.putBytes("sms", smsList, sizeof(smsList));
+  phonePrefs.putBytes("call", callList, sizeof(callList));
+  phonePrefs.putUChar("init", 1);
+  phonePrefs.end();
+  return true;
+}
+
+void phonesSeedFactory() {
+  smsCount = 0;
+  callCount = 0;
+  memset(smsList, 0, sizeof(smsList));
+  memset(callList, 0, sizeof(callList));
+  for (int i = 0; i < TARGET_COUNT && smsCount < PHONE_MAX; i++) {
+    normalizePhone(smsList[smsCount], TARGET_PHONES[i]);
+    if (smsList[smsCount][0]) smsCount++;
+  }
+  for (int i = 0; i < ALLOWED_COUNT && callCount < PHONE_MAX; i++) {
+    normalizePhone(callList[callCount], ALLOWED[i]);
+    if (callList[callCount][0]) callCount++;
+  }
+}
+
+void phonesLoad() {
+  smsCount = 0;
+  callCount = 0;
+  memset(smsList, 0, sizeof(smsList));
+  memset(callList, 0, sizeof(callList));
+  if (!phonePrefs.begin("phones", true)) {
+    phonesSeedFactory();
+    phonesSave();
+    return;
+  }
+  uint8_t inited = phonePrefs.getUChar("init", 0);
+  if (!inited) {
+    phonePrefs.end();
+    phonesSeedFactory();
+    phonesSave();
+    return;
+  }
+  smsCount = phonePrefs.getUChar("smsN", 0);
+  callCount = phonePrefs.getUChar("callN", 0);
+  if (smsCount > PHONE_MAX) smsCount = PHONE_MAX;
+  if (callCount > PHONE_MAX) callCount = PHONE_MAX;
+  phonePrefs.getBytes("sms", smsList, sizeof(smsList));
+  phonePrefs.getBytes("call", callList, sizeof(callList));
+  phonePrefs.end();
+  if (smsCount == 0 && callCount == 0) {
+    phonesSeedFactory();
+    phonesSave();
+  }
+  Serial.print(F("[PHONES] SMS="));
+  Serial.print(smsCount);
+  Serial.print(F(" CALL="));
+  Serial.println(callCount);
+}
+
+bool phonesAdd(char list[][16], int& count, const char* digits) {
+  if (!digits || !digits[0]) return false;
+  if (findPhone(list, count, digits) >= 0) return true;
+  if (count >= PHONE_MAX) return false;
+  strncpy(list[count], digits, 15);
+  list[count][15] = 0;
+  count++;
+  return phonesSave();
+}
+
+bool phonesDel(char list[][16], int& count, const char* digits, bool keepLast) {
+  int idx = findPhone(list, count, digits);
+  if (idx < 0) return false;
+  if (keepLast && count <= 1) return false;
+  for (int i = idx; i < count - 1; i++) {
+    strncpy(list[i], list[i + 1], 16);
+  }
+  memset(list[count - 1], 0, 16);
+  count--;
+  return phonesSave();
+}
+
+String listPhones(char list[][16], int count, bool plus) {
+  if (count == 0) return "(пусто)";
+  String s;
+  for (int i = 0; i < count; i++) {
+    if (i) s += "\n";
+    if (plus) s += "+";
+    s += list[i];
+  }
+  return s;
+}
+
+void cfgLoad() {
+  pulsePcLong = PULSE_PC_LONG_DEF;
+  if (!cfgPrefs.begin("cfg", true)) {
+    Serial.println(F("[CFG] NVS empty, defaults"));
+    return;
+  }
+  unsigned long v = cfgPrefs.getULong("longMs", PULSE_PC_LONG_DEF);
+  cfgPrefs.end();
+  if (v < PULSE_PC_LONG_MIN) v = PULSE_PC_LONG_MIN;
+  if (v > PULSE_PC_LONG_MAX) v = PULSE_PC_LONG_MAX;
+  pulsePcLong = v;
+  Serial.print(F("[CFG] pulsePcLong="));
+  Serial.println(pulsePcLong);
+}
+
+bool cfgSave() {
+  if (!cfgPrefs.begin("cfg", false)) return false;
+  cfgPrefs.putULong("longMs", pulsePcLong);
+  cfgPrefs.end();
+  return true;
+}
+
+// SMS-команды настроек импульса:
+//   GET LONG / LONG          — текущее значение (мс)
+//   SET LONG 5000            — установить 1000..30000 мс
+//   RESET LONG               — вернуть заводские 5000 мс
+String handleCfgCommand(const String& upper, const String& cmdLine) {
+  if (upper == "GET LONG" || upper == "LONG") {
+    return "LONG=" + String(pulsePcLong) + " мс\n(короткий=" + String(PULSE_PC_SHORT) + " мс)";
+  }
+
+  if (upper == "RESET LONG") {
+    pulsePcLong = PULSE_PC_LONG_DEF;
+    cfgSave();
+    return "LONG сброшен: " + String(pulsePcLong) + " мс";
+  }
+
+  if (upper.startsWith("SET LONG")) {
+    // "SET LONG 5000" → берём последнее число после "LONG"
+    int p = upper.indexOf("LONG");
+    String numStr = "";
+    if (p >= 0) {
+      numStr = cmdLine.substring(p + 4);
+      numStr.trim();
+    }
+    if (numStr.length() == 0) return "SET LONG <мс>, например SET LONG 5000";
+    long v = numStr.toInt();
+    if (v < (long)PULSE_PC_LONG_MIN || v > (long)PULSE_PC_LONG_MAX) {
+      return "Диапазон " + String(PULSE_PC_LONG_MIN) + ".." + String(PULSE_PC_LONG_MAX) + " мс";
+    }
+    pulsePcLong = (unsigned long)v;
+    if (!cfgSave()) return "Ошибка записи NVS";
+    return "LONG=" + String(pulsePcLong) + " мс (сохранено)";
+  }
+
+  return "";
+}
+
+String handlePhoneCommand(const String& upper, const String& cmdLine) {
+  if (upper == "HELP") {
+    return "ADD SMS +79...\nDEL SMS +79...\nADD CALL +79...\nDEL CALL +79...\nLIST\nRESET PHONES\nGET LONG\nSET LONG 5000\nRESET LONG\nVER\nOTA http://...";
+  }
+
+  if (upper == "LIST" || upper == "LIST SMS" || upper == "LIST CALL") {
+    String out;
+    if (upper != "LIST CALL") {
+      out += "SMS (" + String(smsCount) + "):\n" + listPhones(smsList, smsCount, true);
+    }
+    if (upper == "LIST") out += "\n";
+    if (upper != "LIST SMS") {
+      out += "CALL (" + String(callCount) + "):\n" + listPhones(callList, callCount, true);
+    }
+    return out;
+  }
+
+  if (upper == "RESET PHONES") {
+    phonesSeedFactory();
+    phonesSave();
+    return "Списки сброшены к заводским\nSMS:" + String(smsCount) + " CALL:" + String(callCount);
+  }
+
+  int sp = cmdLine.indexOf(' ');
+  if (sp < 0) return "";
+  String rest = cmdLine.substring(sp + 1);
+  rest.trim();
+  int sp2 = rest.indexOf(' ');
+  String which = rest;
+  String numRaw = "";
+  if (sp2 >= 0) {
+    which = rest.substring(0, sp2);
+    numRaw = rest.substring(sp2 + 1);
+    numRaw.trim();
+  }
+  which.toUpperCase();
+
+  char digits[16];
+  normalizePhone(digits, numRaw.c_str());
+  bool isSms = (which == "SMS");
+  bool isCall = (which == "CALL" || which == "WL");
+  if (!isSms && !isCall) return "";
+  if (upper.startsWith("ADD ") || upper.startsWith("DEL ")) {
+    if (strlen(digits) < 10) return "Некорректный номер";
+  }
+
+  if (upper.startsWith("ADD ")) {
+    bool ok = isSms
+      ? phonesAdd(smsList, smsCount, digits)
+      : phonesAdd(callList, callCount, digits);
+    if (!ok) return "Не добавлен (лимит " + String(PHONE_MAX) + ")";
+    return String("Добавлен в ") + (isSms ? "SMS" : "CALL") + ": +" + digits;
+  }
+
+  if (upper.startsWith("DEL ")) {
+    if (isCall) {
+      if (callCount <= 1) return "Нельзя удалить последний CALL";
+      if (!phonesDel(callList, callCount, digits, true)) return "Номер не найден в CALL";
+      return String("Удалён из CALL: +") + digits;
+    }
+    if (!phonesDel(smsList, smsCount, digits, false)) return "Номер не найден в SMS";
+    return String("Удалён из SMS: +") + digits;
+  }
+
+  return "";
+}
+
+void processIncomingSms(int index) {
+  if (index < 0) return;
+  smsBusy = true;
+
+  sim800.print(F("AT+CMGR="));
+  sim800.println(index);
+
+  String sender;
+  String body;
+  bool gotHeader = false;
+  bool done = false;
+  unsigned long t = millis();
+  String acc;
+
+  while (!done && (millis() - t < 8000)) {
+    while (sim800.available()) {
+      char c = (char)sim800.read();
+      if (c == '\r') continue;
+      if (c == '\n') {
+        acc.trim();
+        if (acc.length() == 0) {
+          acc = "";
+          continue;
+        }
+        Serial.println(acc);
+        if (!gotHeader && acc.startsWith("+CMGR:")) {
+          gotHeader = true;
+          sender = extractQuoted(acc, 1);
+          acc = "";
+          continue;
+        }
+        if (gotHeader && (acc == "OK" || acc == "ERROR")) {
+          done = true;
+          acc = "";
+          break;
+        }
+        if (gotHeader) {
+          if (body.length()) body += "\n";
+          body += acc;
+        } else {
+          handleLine(acc);
+        }
+        acc = "";
+      } else {
+        acc += c;
+      }
+    }
+  }
+
+  sim800.print(F("AT+CMGD="));
+  sim800.println(index);
+  waitOK(2000);
+  smsBusy = false;
+
+  if (!gotHeader) return;
+
+  String digits = digitsOnly(sender);
+  if (!isPhoneAllowed(digits)) {
+    Serial.println(F("[SMS] Command ignored: sender not allowed"));
+    return;
+  }
+
+  body = maybeUcs2HexToText(body);
+  body.trim();
+  int nl = body.indexOf('\n');
+  String cmdLine = (nl >= 0) ? body.substring(0, nl) : body;
+  cmdLine.trim();
+  String upper = cmdLine;
+  upper.toUpperCase();
+
+  String replyTo = toSmsNumber(digits);
+
+  if (upper == "VER" || upper == "VERSION") {
+    sendSMS(replyTo, String("ВЕРСИЯ: ") + FW_VERSION + "\n" + DEVICE_ADDRESS +
+            "\nLONG=" + String(pulsePcLong) + " мс");
+    return;
+  }
+
+  {
+    String cfgReply = handleCfgCommand(upper, cmdLine);
+    if (cfgReply.length()) {
+      sendSMS(replyTo, cfgReply);
+      return;
+    }
+  }
+
+  {
+    String phoneReply = handlePhoneCommand(upper, cmdLine);
+    if (phoneReply.length()) {
+      sendSMS(replyTo, phoneReply);
+      return;
+    }
+  }
+
+  if (upper.startsWith("OTA")) {
+    int sp = cmdLine.indexOf(' ');
+    if (sp < 0) {
+      sendSMS(replyTo, "OTA: укажите URL, например OTA http://host/fw.bin");
+      return;
+    }
+    String url = cmdLine.substring(sp + 1);
+    url.trim();
+    String host, path;
+    int port = 80;
+    if (!parseHttpUrl(url, host, port, path)) {
+      sendSMS(replyTo, "OTA: нужен HTTP URL (не HTTPS)");
+      return;
+    }
+    otaUrl = url;
+    otaRequester = replyTo;
+    otaPending = true;
+    sendSMS(replyTo, "OTA: начинаю загрузку\n" + url);
+    return;
+  }
+}
+
+void performOta() {
+  if (otaUrl.length() == 0) return;
+
+  String host, path;
+  int port = 80;
+  if (!parseHttpUrl(otaUrl, host, port, path)) {
+    sendSMS(otaRequester, "OTA: некорректный URL");
+    return;
+  }
+
+  otaBusy = true;
+  Serial.print(F("[OTA] GET "));
+  Serial.print(host);
+  Serial.print(':');
+  Serial.print(port);
+  Serial.println(path);
+
+  String result = "OTA: ошибка";
+  bool ok = false;
+  uint8_t chunk[OTA_CHUNK_SIZE];
+  size_t bodyGot = 0;
+  int contentLength = -1;
+  int httpCode = 0;
+  bool headerDone = false;
+  String header;
+  unsigned long started = millis();
+  int emptyReads = 0;
+
+  if (!gprsAttach()) {
+    result = "OTA: нет GPRS (проверьте APN)";
+    goto ota_done;
+  }
+  if (!tcpOpen(host, port)) {
+    result = "OTA: не удалось открыть TCP";
+    goto ota_done;
+  }
+
+  sendAT("AT+CIPSEND");
+  if (!waitPrompt(8000)) {
+    result = "OTA: нет приглашения CIPSEND";
+    goto ota_done;
+  }
+
+  {
+    String req = "GET " + path + " HTTP/1.0\r\nHost: " + host + "\r\nConnection: close\r\nUser-Agent: ESP32-SIM800-OTA\r\n\r\n";
+    sim800.print(req);
+    sim800.write(26);
+  }
+  if (!waitModemToken("SEND OK", 20000)) {
+    result = "OTA: HTTP-запрос не отправлен";
+    goto ota_done;
+  }
+
+  while (!headerDone) {
+    if (millis() - started > OTA_TOTAL_TMO) {
+      result = "OTA: таймаут заголовка";
+      goto ota_done;
+    }
+    int remaining = 0;
+    int n = cipRead(chunk, OTA_CHUNK_SIZE, remaining);
+    if (n == -2) {
+      result = "OTA: TCP закрыт до заголовка";
+      goto ota_done;
+    }
+    if (n < 0) {
+      result = "OTA: ошибка чтения заголовка";
+      goto ota_done;
+    }
+    if (n == 0) {
+      emptyReads++;
+      if (emptyReads > 80) {
+        result = "OTA: пустой ответ сервера";
+        goto ota_done;
+      }
+      delay(200);
+      yield();
+      continue;
+    }
+    emptyReads = 0;
+    for (int i = 0; i < n; i++) header += (char)chunk[i];
+    int pos = header.indexOf("\r\n\r\n");
+    if (pos < 0) {
+      if (header.length() > OTA_HDR_MAX) {
+        result = "OTA: слишком большой HTTP-заголовок";
+        goto ota_done;
+      }
+      continue;
+    }
+    headerDone = true;
+    String hdr = header.substring(0, pos);
+    int sp1 = hdr.indexOf(' ');
+    if (sp1 > 0) httpCode = hdr.substring(sp1 + 1, sp1 + 4).toInt();
+    int clPos = hdr.indexOf("Content-Length:");
+    if (clPos < 0) clPos = hdr.indexOf("content-length:");
+    if (clPos >= 0) {
+      int eol = hdr.indexOf("\r\n", clPos);
+      contentLength = hdr.substring(clPos + 15, eol < 0 ? hdr.length() : eol).toInt();
+    }
+    if (httpCode != 200) {
+      result = "OTA: HTTP " + String(httpCode);
+      goto ota_done;
+    }
+    if (contentLength <= 0 || (unsigned long)contentLength > OTA_MAX_BYTES) {
+      result = "OTA: некорректный размер " + String(contentLength);
+      goto ota_done;
+    }
+    if (!Update.begin((size_t)contentLength)) {
+      result = "OTA: Update.begin() failed";
+      goto ota_done;
+    }
+    {
+      int bodyStart = pos + 4;
+      int bodyN = (int)header.length() - bodyStart;
+      if (bodyN > 0) {
+        // ESP32 core 3.x: Update.write() принимает uint8_t*, не const
+        uint8_t* p = (uint8_t*)(header.c_str() + bodyStart);
+        if (Update.write(p, (size_t)bodyN) != (size_t)bodyN) {
+          result = "OTA: ошибка записи flash";
+          Update.abort();
+          goto ota_done;
+        }
+        bodyGot += (size_t)bodyN;
+      }
+    }
+    header = "";
+  }
+
+  while (bodyGot < (size_t)contentLength) {
+    if (millis() - started > OTA_TOTAL_TMO) {
+      result = "OTA: таймаут загрузки";
+      Update.abort();
+      goto ota_done;
+    }
+    int remaining = 0;
+    int n = cipRead(chunk, OTA_CHUNK_SIZE, remaining);
+    if (n == -2) break;
+    if (n < 0) {
+      result = "OTA: обрыв на " + String(bodyGot) + "/" + String(contentLength);
+      Update.abort();
+      goto ota_done;
+    }
+    if (n == 0) {
+      emptyReads++;
+      if (emptyReads > 80) {
+        result = "OTA: обрыв на " + String(bodyGot) + "/" + String(contentLength);
+        Update.abort();
+        goto ota_done;
+      }
+      delay(200);
+      yield();
+      continue;
+    }
+    yield();
+    emptyReads = 0;
+    size_t take = (size_t)n;
+    if (bodyGot + take > (size_t)contentLength) take = (size_t)contentLength - bodyGot;
+    if (Update.write(chunk, take) != take) {
+      result = "OTA: ошибка записи flash";
+      Update.abort();
+      goto ota_done;
+    }
+    bodyGot += take;
+    if ((bodyGot & 0x7FFF) < take) {
+      Serial.print(F("[OTA] "));
+      Serial.print(bodyGot);
+      Serial.print('/');
+      Serial.println(contentLength);
+    }
+  }
+
+  if (bodyGot != (size_t)contentLength) {
+    result = "OTA: неполный файл " + String(bodyGot) + "/" + String(contentLength);
+    Update.abort();
+    goto ota_done;
+  }
+  if (!Update.end(true)) {
+    result = "OTA: Update.end() failed";
+    goto ota_done;
+  }
+
+  ok = true;
+  result = String("OTA: ок, ") + String(bodyGot) + " байт, перезагрузка";
+
+ota_done:
+  gprsShutdown();
+  otaBusy = false;
+  Serial.println(result);
+  if (otaRequester.length()) sendSMS(otaRequester, result);
+  otaUrl = "";
+  if (ok) {
+    delay(2000);
+    ESP.restart();
+  }
 }
